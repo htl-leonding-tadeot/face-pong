@@ -3,7 +3,7 @@ import cv2
 width = 1280
 height = 720
 
-face_cascade = cv2.CascadeClassifier(r'/home/raphael/Dev/Python/haarcascade_frontalface_default.xml')
+face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FPS, 30)
