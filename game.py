@@ -16,6 +16,7 @@ cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
+
 class Vec:
     def __init__(self, x, y, dx, dy):
         self.x = x
@@ -33,6 +34,11 @@ ball.y = int(height/2)
 ball.dy = 20
 ball.dx = -20
 
+leftScore = 0
+rightScore = 0
+
+cv2.putText(image, 'Left Player Score: ' + leftScore)
+cv2.putText(image, 'Right Player Score: ' + rightScore)
 
 while True:
     ret, img = cap.read()
@@ -55,10 +61,14 @@ while True:
     if ball.x > width - 5:
         ball.x = width - 5
         ball.dx *= -1
+        # add score for left player here
+        leftScore = leftScore + 1
 
     if ball.x < 0:
         ball.x = 0
         ball.dx *= -1
+        # add score for right player here
+        rightScore = rightScore + 1
 
     faceCords = []
 
