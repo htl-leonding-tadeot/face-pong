@@ -37,8 +37,7 @@ ball.dx = -20
 leftScore = 0
 rightScore = 0
 
-cv2.putText(image, 'Left Player Score: ' + leftScore)
-cv2.putText(image, 'Right Player Score: ' + rightScore)
+
 
 while True:
     ret, img = cap.read()
@@ -59,14 +58,18 @@ while True:
         ball.dy *= -1
 
     if ball.x > width - 5:
-        ball.x = width - 5
-        ball.dx *= -1
+        ball.x = int(width / 2)
+        ball.y = int(height / 2)
+        ball.dy = 20
+        ball.dx = -20
         # add score for left player here
         leftScore = leftScore + 1
 
     if ball.x < 0:
-        ball.x = 0
-        ball.dx *= -1
+        ball.x = int(width / 2)
+        ball.y = int(height / 2)
+        ball.dy = 20
+        ball.dx = -20
         # add score for right player here
         rightScore = rightScore + 1
 
@@ -91,7 +94,8 @@ while True:
             print(ball.dx, ball.x)
 
     cv2.circle(img, (ball.x, ball.y), 9, (0, 0, 255), -1)
-
+    text1 = cv2.putText(img, 'Left Player Score: ' + str(leftScore), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    text2 = cv2.putText(img, 'Right Player Score: ' + str(rightScore), (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     cv2.imshow(window_name, img)
 
     k = cv2.waitKey(30) & 0xff
