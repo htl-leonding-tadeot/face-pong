@@ -1,353 +1,436 @@
 import cv2
 import numpy as np
 import random
-import math
 import time
-import subprocess  # For running shell commands
-import os          # For restarting the script
-import sys         # For restarting the script
+import os
+import sys
 
-width = 1280
-height = 720
+# --- CONFIGURATION ---
 
-# Make sure 'haarcascade_frontalface_default.xml' is in the same directory
-face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
+# IMPORTANT: Make sure this path is correct!
+# Download the file from: https://github.com/opencv/opencv/blob/master/data/haarcascades/haarcascade_frontalface_default.xml
+CASCADE_PATH = r'./haarcascade_frontalface_default.xml'
 
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(3, width)
-cap.set(4, height)
+# Game settings
+GRAVITY = 0.6
+BALL_RADIUS = 25
+BOUNCE_STRENGTH = -18  # Strong negative velocity for upward bounce
+MAX_BALLS = 8
+POINTS_PER_BOUNCE = 1
+SCORE_TO_ADD_BALL = 10
+MAX_BALL_BOUNCES = 5 # Max bounces allowed before ball is removed
 
-window_name = "image"
+# Auto-Restart Configuration
+INACTIVITY_TIMEOUT_SEC = 60.0 # Time (in seconds) with no faces detected before restart
 
-cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+# Player Tracking Configuration (FOR STABILITY)
+# Increased tolerance: Max 300 pixels movement per frame before losing track of a player
+MAX_DISTANCE_SQUARED = 90000 # Increased from 25600 (160px) to 90000 (300px) for better stability
+DECAY_TIMEOUT = 5.0          # Seconds before an unseen player is removed (increased from 3.0s)
+MIN_CONSECUTIVE_DETECTIONS = 3 # Frames required to confirm a new player
 
+# --- GAME STATE ---
+balls = []
+# 'players' stores confirmed active player state: {player_id: {'score', 'last_seen_time', 'face_rect'}}
+players = {}
+# 'pending_faces' stores faces seen recently but not yet confirmed:
+# {temp_id: {'count', 'last_seen_time', 'face_rect'}}
+pending_faces = {}
+next_player_id = 1
+next_pending_id = 1
+last_ball_spawn_score = -1
 
-# --- Helper function to check for git updates ---
-def check_for_update():
-    """
-    Fetches from remote, compares local and remote hashes, and pulls if different.
-    Returns True if an update was pulled, False otherwise.
-    """
-    try:
-        print("Checking for updates...")
-        # 1. Fetch updates from remote without applying them
-        subprocess.run(["git", "fetch"], check=True, capture_output=True)
+# --- HELPER FUNCTIONS ---
 
-        # 2. Get the commit hash of the local HEAD
-        local_hash = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True
-        ).stdout.strip()
+def restart_game():
+    """Restarts the current Python script process."""
+    print("--- GAME RESTARTING ---")
+    print(f"Executing restart now (manual 'r' keypress or inactivity timeout).")
+    os.execv(sys.executable, ['python'] + sys.argv)
 
-        # 3. Get the commit hash of the remote branch (upstream)
-        remote_hash = subprocess.run(
-            ["git", "rev-parse", "@{u}"],
-            check=True, capture_output=True, text=True
-        ).stdout.strip()
+def spawn_ball(screen_width):
+    """Creates a new ball and adds it to the list."""
+    global balls
+    if len(balls) < MAX_BALLS:
+        new_ball = {
+            'pos': [random.randint(BALL_RADIUS * 2, screen_width - BALL_RADIUS * 2), BALL_RADIUS],
+            'vel': [random.uniform(-3, 3), 0],
+            'radius': BALL_RADIUS,
+            'color': (random.randint(0, 255), random.randint(0, 255), 255),
+            'bounces': 0 # Bounce counter
+        }
+        balls.append(new_ball)
+        print(f"Spawning new ball! Total balls: {len(balls)}")
 
-        if local_hash != remote_hash:
-            print(f"New update found (Local: {local_hash[:7]}, Remote: {remote_hash[:7]}). Pulling changes...")
-            # 4. Pull the changes
-            subprocess.run(["git", "pull"], check=True)
-            return True # Update was pulled
-        else:
-            print("No update found. Already up-to-date.")
-            return False # Already up-to-date
+def init_game():
+    """Initializes the game window and camera."""
 
-    except subprocess.CalledProcessError as e:
-        print(f"Git command failed: {e}")
-        print("Please ensure you are in a git repository and the upstream branch is set.")
-        return False # Error, don't restart
-    except FileNotFoundError:
-        print("Git command not found. Please ensure git is installed and in your PATH.")
-        return False # Error, don't restart
+    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+    if face_cascade.empty():
+        print(f"CRITICAL ERROR: Could not load face cascade from '{CASCADE_PATH}'")
+        return None, None, None, None
 
-# --- Helper function to restart the script ---
-def restart_script():
-    """
-    Restarts the current Python script, replacing the current process.
-    """
-    print("Restarting script with new code...")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("CRITICAL ERROR: Could not open video camera.")
+        return None, None, None, None
 
+    # Attempt to set HD resolution
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-class Vec:
-    def __init__(self, x, y, dx, dy):
-        self.x = x
-        self.y = y
-        self.dx = dx
-        self.dy = dy
-
-
-def reset_ball(ball, speed=15):
-    """Reset ball to center with random direction within 15 degrees"""
-    ball.x = width/2
-    ball.y = height/2
-
-    # Random angle between -15 and 15 degrees
-    angle = random.uniform(-15, 15)
-    angle_rad = math.radians(angle)
-
-    # Random direction (left or right)
-    direction = random.choice([-1, 1])
-
-    # Calculate velocity components
-    ball.dx = direction * speed * math.cos(angle_rad)
-    ball.dy = speed * math.sin(angle_rad)
-
-
-paddleX = width - 230
-
-ball = Vec(100, 100, 10, 10)
-reset_ball(ball)
-
-leftScore = 0
-rightScore = 0
-
-# --- Game & Paddle Constants ---
-PADDLE_WIDTH = 30
-PADDLE_HEIGHT = 100
-BALL_RADIUS = 9
-PADDLE_INFLUENCE_FACTOR = 0.5
-
-# --- Angle Clamping Constants ---
-MIN_ANGLE_DEG = 15
-MAX_ANGLE_DEG = 60
-MIN_ANGLE_TAN = math.tan(math.radians(MIN_ANGLE_DEG))
-MAX_ANGLE_TAN = math.tan(math.radians(MAX_ANGLE_DEG))
-
-
-# --- AFK Bot Constants ---
-AFK_TIMEOUT = 10.0
-BOT_SPEED = 12
-BOT_DEV_RANGE = 75
-BOT_OVERSHOOT_FACTOR = 1.1
-BOT_UPDATE_INTERVAL = 3
-BOT_SMOOTHING_FACTOR = 0.2 # NEW: (e.g., 0.2 = 20% smoothing per frame)
-
-# --- Persistent Paddle Vertical Positions ---
-leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
-rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
-
-# --- Previous Paddle Positions (for speed tracking) ---
-prevLeftPaddleY = leftPaddleY
-prevRightPaddleY = rightPaddleY
-
-# --- Bot Target/Frame Tracking ---
-raw_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # RENAMED
-raw_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # RENAMED
-smooth_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # NEW
-smooth_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # NEW
-frame_counter = 0
-
-# --- AFK Time Tracking ---
-current_time = time.time()
-last_face_time_left = current_time
-last_face_time_right = current_time
-
-# --- Auto-Update Tracking ---
-UPDATE_CHECK_INTERVAL = 600 # 10 minutes (in seconds)
-last_update_check_time = current_time
-update_check_pending = False
-was_idle_last_frame = False # Check for transition to idle
-
-
-# --- Center line for assignment ---
-center_x = width / 2
-
-
-while True:
-    current_time = time.time()
-    frame_counter += 1
-
-    ret, img = cap.read()
+    ret, frame = cap.read()
     if not ret:
-        break
+        print("CRITICAL ERROR: Could not read frame from camera.")
+        cap.release()
+        return None, None, None, None
 
-    img = cv2.flip(img, 1)
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    screen_height, screen_width = frame.shape[:2]
+    print(f"Camera feed initialized: {screen_width}x{screen_height}")
 
-    # --- Face Detection ---
-    faces = face_cascade.detectMultiScale(gray_img, 1.25, 4)
+    cv2.namedWindow('Face Bouncer', cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty('Face Bouncer', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # --- 1. Ball Movement ---
-    ball.x += ball.dx
-    ball.y += ball.dy
+    spawn_ball(screen_width)
 
-    # --- 2. Wall & Goal Collisions ---
-    if ball.y > height - BALL_RADIUS:
-        ball.y = height - BALL_RADIUS
-        ball.dy *= -1
-    if ball.y < BALL_RADIUS:
-        ball.y = BALL_RADIUS
-        ball.dy *= -1
-    if ball.x > width - BALL_RADIUS:
-        reset_ball(ball)
-        leftScore = leftScore + 1
-    if ball.x < BALL_RADIUS:
-        reset_ball(ball)
-        rightScore = rightScore + 1
+    return cap, face_cascade, screen_width, screen_height
 
-    # --- 3. Location-based Paddle Assignment (Human Input) ---
-    best_left_y = None
-    best_right_y = None
+def track_faces(new_faces, current_time):
+    """
+    Implements stable tracking by matching faces to existing players (Green border)
+    or temporary pending faces (Yellow border) before confirming a new player.
+    """
+    global players, pending_faces, next_player_id, next_pending_id
 
-    for (x, y, w, h) in faces:
-        face_center_x = x + w / 2
+    matched_players = {}
 
-        if face_center_x < center_x:
-            if best_left_y is None or y < best_left_y:
-                best_left_y = y
-        else:
-            if best_right_y is None or y < best_right_y:
-                best_right_y = y
+    # new_pending_faces will hold all pending faces for the NEXT frame:
+    # 1. Matched but not promoted (count > 1)
+    # 2. Missed but not decayed
+    # 3. Brand new faces (count = 1)
+    new_pending_faces = {}
+    unmatched_new_faces = list(new_faces)
 
-    if best_left_y is not None:
-        leftPaddleY = best_left_y
-        last_face_time_left = current_time
+    # --- 1. Match new faces to ACTIVE players (Green, Scored) ---
+    for player_id, player in players.items():
+        best_match_index = -1
+        min_distance_sq = MAX_DISTANCE_SQUARED
 
-    if best_right_y is not None:
-        rightPaddleY = best_right_y
-        last_face_time_right = current_time
+        for i, (x, y, w, h) in enumerate(unmatched_new_faces):
+            p_x, p_y, p_w, p_h = player['face_rect']
+            p_center = (p_x + p_w / 2, p_y + p_h / 2)
+            f_center = (x + w / 2, y + h / 2)
+            distance_sq = (p_center[0] - f_center[0])**2 + (p_center[1] - f_center[1])**2
 
-    # --- 4. AFK Bot Logic ---
+            if distance_sq < min_distance_sq:
+                min_distance_sq = distance_sq
+                best_match_index = i
 
-    # 4a. Update Bot's RAW Target (Reaction Time)
-    # This still only runs every few frames, simulating human reaction delay
-    if frame_counter % BOT_UPDATE_INTERVAL == 0:
-        deviation = random.uniform(-BOT_DEV_RANGE, BOT_DEV_RANGE)
-        base_target_y = ball.y + deviation
+        if best_match_index != -1:
+            # Match found for active player: Update position and remove face from pool
+            new_face_rect = unmatched_new_faces.pop(best_match_index)
+            player['face_rect'] = new_face_rect
+            player['last_seen_time'] = current_time
+            matched_players[player_id] = player
 
-        if ball.dx < 0: # Left Bot tracks
-            raw_left_bot_target_y = base_target_y
-        if ball.dx > 0: # Right Bot tracks
-            raw_right_bot_target_y = base_target_y
+    # --- 2. Match remaining new faces to PENDING faces (Yellow, Unconfirmed) ---
 
-    # 4b. NEW: Update Bot's SMOOTH Target (Movement Fluidity)
-    # This runs every frame, making the bot's goal glide smoothly
-    smooth_left_bot_target_y = (smooth_left_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_left_bot_target_y * BOT_SMOOTHING_FACTOR)
-    smooth_right_bot_target_y = (smooth_right_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_right_bot_target_y * BOT_SMOOTHING_FACTOR)
+    for temp_id, pending in pending_faces.items():
+        best_match_index = -1
+        min_distance_sq = MAX_DISTANCE_SQUARED
 
+        for i, (x, y, w, h) in enumerate(unmatched_new_faces):
+            p_x, p_y, p_w, p_h = pending['face_rect']
+            p_center = (p_x + p_w / 2, p_y + p_h / 2)
+            f_center = (x + w / 2, y + h / 2)
+            distance_sq = (p_center[0] - f_center[0])**2 + (p_center[1] - f_center[1])**2
 
-    # 4c. Left Paddle Bot Movement
-    is_afk_left = False
-    if current_time - last_face_time_left > AFK_TIMEOUT:
-        is_afk_left = True
-        paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
-        # Use the SMOOTH target for movement
-        diff_y = (smooth_left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
-        move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        leftPaddleY = int(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+            if distance_sq < min_distance_sq:
+                min_distance_sq = distance_sq
+                best_match_index = i
 
-    # 4d. Right Paddle Bot Movement
-    is_afk_right = False
-    if current_time - last_face_time_right > AFK_TIMEOUT:
-        is_afk_right = True
-        paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
-        # Use the SMOOTH target for movement
-        diff_y = (smooth_right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
-        move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+        if best_match_index != -1:
+            # Match found for pending face: Increment count and remove face from pool
+            new_rect = unmatched_new_faces.pop(best_match_index)
+            pending['count'] += 1
+            pending['face_rect'] = new_rect
+            pending['last_seen_time'] = current_time
 
-    # 4e. Calculate Paddle Speeds
-    leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
-    rightPaddleSpeed = rightPaddleY - prevRightPaddleY
-
-
-    # --- 5. Paddle Drawing and Collision Check ---
-
-    paddle_data = [
-        (0, leftPaddleY, is_afk_left, leftPaddleSpeed),
-        (1, rightPaddleY, is_afk_right, rightPaddleSpeed)
-    ]
-
-    for index, paddle_y, is_afk, paddle_speed in paddle_data:
-        paddle_x = 100 + (index * paddleX)
-
-        # Orange for Human, Blue for Bot
-        color = (0, 165, 255) if not is_afk else (255, 0, 0)
-
-        # Draw paddle
-        cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
-
-        # Collision Check:
-        if paddle_y - BALL_RADIUS <= ball.y <= paddle_y + PADDLE_HEIGHT + BALL_RADIUS:
-
-            # --- Left paddle (index == 0) ---
-            if index == 0:
-                if ball.dx < 0 and (paddle_x + PADDLE_WIDTH) >= (ball.x - BALL_RADIUS) >= paddle_x:
-                    ball.dx *= -1
-                    ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
-
-                    # Apply Paddle Influence & Clamp Angle
-                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
-                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-                    sign_dy = np.sign(ball.dy)
-                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
-                    ball.dy = clamped_abs_dy * sign_dy
-
-            # --- Right paddle (index == 1) ---
+            if pending['count'] >= MIN_CONSECUTIVE_DETECTIONS:
+                # CONFIRMED: Promote to active player
+                print(f"Player {next_player_id} confirmed after {pending['count']} frames.")
+                new_player = {
+                    'score': 0,
+                    'last_seen_time': current_time,
+                    'face_rect': new_rect
+                }
+                matched_players[next_player_id] = new_player
+                next_player_id += 1
+                # NOTE: The promoted player is removed from the pending pool implicitly
+                # because we only add non-promoted faces to new_pending_faces below.
             else:
-                if ball.dx > 0 and paddle_x <= (ball.x + BALL_RADIUS) <= (paddle_x + PADDLE_WIDTH):
-                    ball.dx *= -1
-                    ball.x = paddle_x - BALL_RADIUS
+                # Still pending, keep tracking (Add to the next frame's pending list)
+                new_pending_faces[temp_id] = pending
 
-                    # Apply Paddle Influence & Clamp Angle
-                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
-                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-                    sign_dy = np.sign(ball.dy)
-                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
-                    ball.dy = clamped_abs_dy * sign_dy
+        elif current_time - pending['last_seen_time'] < DECAY_TIMEOUT:
+            # Pending face missed this frame, but keep them until decay timeout is hit
+            new_pending_faces[temp_id] = pending
 
-    # --- 6. Drawing and Display ---
-    cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
-
-    left_status = "Bot" if is_afk_left else "Human"
-    right_status = "Bot" if is_afk_right else "Human"
-
-    text1 = cv2.putText(img, f'L ({left_status}): {leftScore}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-    text2 = cv2.putText(img, f'R ({right_status}): {rightScore}', (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-
-    cv2.imshow(window_name, img)
-
-    # --- 7. Auto-Update Logic ---
-
-    # 7a. Check if 10 minutes have passed to flag a pending update
-    if current_time - last_update_check_time > UPDATE_CHECK_INTERVAL:
-        print("10-minute interval passed. Flagging for update check.")
-        update_check_pending = True
-        last_update_check_time = current_time # Reset the 10-min timer
-
-    # 7b. Check if we should perform the update check
-    is_idle = is_afk_left and is_afk_right
-    just_became_idle = is_idle and not was_idle_last_frame
-
-    if update_check_pending and is_idle:
-
-        if just_became_idle:
-            print("Transitioned to dual bot mode with update pending. Checking now...")
-        else:
-            print("Idle mode and 10-min timer elapsed. Checking now...")
-
-        if check_for_update():
-            restart_script() # This will stop the script
-
-        update_check_pending = False
+    # --- 3. Add remaining unmatched faces as new PENDING faces ---
+    for x, y, w, h in unmatched_new_faces:
+        new_pending = {
+            'face_rect': (x, y, w, h),
+            'count': 1,
+            'last_seen_time': current_time
+        }
+        new_pending_faces[next_pending_id] = new_pending
+        next_pending_id += 1
 
 
-    # --- 8. Exit Condition ---
-    k = cv2.waitKey(30) & 0xff
-    if k == 27: # ESC key
-        break
+    # --- 4. Finalize State (Decay) ---
 
-    # --- 9. Update previous frame's paddle positions ---
-    prevLeftPaddleY = leftPaddleY
-    prevRightPaddleY = rightPaddleY
-    was_idle_last_frame = is_idle # Update idle state for next frame
+    # Active Player Decay: Keep players that were seen this frame OR haven't decayed
+    final_players = matched_players
+    for player_id, player in players.items():
+        if player_id not in matched_players and current_time - player['last_seen_time'] < DECAY_TIMEOUT:
+            # Ensure the player object is copied back if it's still within the decay window
+            final_players[player_id] = player
 
-cap.release()
-cv2.destroyAllWindows()
+    players = final_players
+
+    # Pending Face Cleanup: We use the already accumulated list from steps 2 & 3.
+    pending_faces = new_pending_faces
+
+
+def main_game_loop():
+    """Runs the main game loop."""
+    global next_player_id, last_ball_spawn_score, balls
+
+    cap, face_cascade, screen_width, screen_height = init_game()
+
+    if cap is None:
+        return
+
+    last_activity_time = time.time()
+
+    while True:
+        # --- 1. CAPTURE FRAME AND FIND FACES ---
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Lost camera feed.")
+            break
+
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Detect faces
+        new_faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.2,
+            minNeighbors=5,
+            minSize=(80, 80)
+        )
+
+        current_time = time.time()
+
+        # Run stable tracking logic
+        track_faces(new_faces, current_time)
+
+        # --- ACTIVITY CHECK & AUTO-RESTART ---
+        # Activity check now includes both confirmed players and faces pending confirmation
+        if len(players) > 0 or len(pending_faces) > 0:
+            last_activity_time = current_time
+
+            # If no faces are detected for the timeout period, restart the game
+        elif current_time - last_activity_time > INACTIVITY_TIMEOUT_SEC:
+            restart_game()
+            break
+
+            # Calculate the collective score for spawning new balls
+        total_score = sum(p['score'] for p in players.values())
+
+        # --- 2. GAME LOGIC ---
+
+        # Check for new ball spawn (Score-based increase)
+        if total_score > 0 and total_score // SCORE_TO_ADD_BALL > last_ball_spawn_score and len(balls) < MAX_BALLS:
+            spawn_ball(screen_width)
+            last_ball_spawn_score = total_score // SCORE_TO_ADD_BALL
+
+        # Update and check collisions for each ball
+        for ball in balls[:]:
+
+            # Apply gravity
+            ball['vel'][1] += GRAVITY
+
+            # Update position
+            ball['pos'][0] += ball['vel'][0]
+            ball['pos'][1] += ball['vel'][1]
+
+            # --- Collision Detection ---
+            ball_x = int(ball['pos'][0])
+            ball_y = int(ball['pos'][1])
+            ball_r = ball['radius']
+
+            ball_consumed_by_hit = False
+
+            # Check for face hits (paddles) - only use CONFIRMED players
+            for player_id, player in players.items():
+                x, y, w, h = player['face_rect']
+
+                # Find closest point on the rect to the ball's center
+                closest_x = max(x, min(ball_x, x + w))
+                closest_y = max(y, min(ball_y, y + h))
+
+                # Calculate distance
+                distance = ( (ball_x - closest_x)**2 + (ball_y - closest_y)**2 )**0.5
+
+                if distance < ball_r and ball['vel'][1] > 0: # Hit and moving downwards
+
+                    # 1. UPDATE THIS PLAYER'S SCORE AND BALL STATE
+                    player['score'] += POINTS_PER_BOUNCE
+                    ball['bounces'] += 1 # Increment bounce count
+
+                    # 2. APPLY BOUNCE PHYSICS
+                    # Reverse and dampen vertical velocity
+                    ball['vel'][1] = BOUNCE_STRENGTH
+
+                    # Add small horizontal speed change based on where the ball hit the face
+                    center_x = x + w / 2
+                    hit_offset = ball_x - center_x
+                    ball['vel'][0] += hit_offset / (w / 2) * 5 # Max +/- 5 horizontal velocity change
+
+                    # 3. CHECK FOR MAX BOUNCES (Despawn condition)
+                    if ball['bounces'] >= MAX_BALL_BOUNCES:
+                        # Despawn the ball
+                        balls.remove(ball)
+                        ball_consumed_by_hit = True
+                        print(f"Ball despawned after {MAX_BALL_BOUNCES} bounces.")
+
+                        # FIX: Spawn a replacement ball immediately if the ball count is low.
+                        if len(balls) < MAX_BALLS:
+                            spawn_ball(screen_width)
+
+                    break # Stop checking other players for this ball
+
+            # If the ball was removed by a hit, skip the rest of the physics and screen checks
+            if ball_consumed_by_hit:
+                continue
+
+                # Check for screen boundaries
+
+            # Left/Right walls
+            if ball['pos'][0] - ball_r <= 0:
+                ball['pos'][0] = ball_r
+                ball['vel'][0] *= -0.8
+            elif ball['pos'][0] + ball_r >= screen_width:
+                ball['pos'][0] = screen_width - ball_r
+                ball['vel'][0] *= -0.8
+
+            # Top wall
+            if ball['pos'][1] - ball_r <= 0:
+                ball['pos'][1] = ball_r
+                ball['vel'][1] *= -0.5
+
+            # Bottom wall (CONSUME BALL - MISS)
+            if ball['pos'][1] + ball_r >= screen_height:
+
+                # The ball is consumed (removed) upon hitting the floor.
+                balls.remove(ball)
+
+                # Adjust spawn tracking to make it slightly easier to get the next ball back
+                last_ball_spawn_score = max(-1, last_ball_spawn_score - 1)
+
+                # If the last ball was consumed, immediately spawn a new one to keep the game running.
+                if not balls:
+                    spawn_ball(screen_width)
+
+                continue
+
+                # --- 3. DRAWING ---
+
+        # Note: Drawing of pending faces (yellow rects) removed as requested.
+
+        # Draw all confirmed players (Green border, with score)
+        for player_id, player in players.items():
+            x, y, w, h = player['face_rect']
+
+            # Draw the face rectangle (Paddle) - Green for active player
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 4)
+
+            # Draw player ID and score above the face
+            score_text = f"P{player_id}: {player['score']}"
+            text_size = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_DUPLEX, 1.0, 3)[0]
+            text_x = x + (w - text_size[0]) // 2
+            text_y = y - 10 # Position 10 pixels above the face
+
+            # Draw white background/shadow for readability
+            cv2.putText(frame, score_text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 255, 255), 6)
+            # Draw score text in blue
+            cv2.putText(frame, score_text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 0, 0), 3)
+
+        # Draw all balls
+        for ball in balls:
+            bounce_count = MAX_BALL_BOUNCES - ball['bounces']
+            bounce_text = f'{bounce_count}'
+
+            # Draw the ball
+            cv2.circle(frame, (int(ball['pos'][0]), int(ball['pos'][1])), ball['radius'], ball['color'], -1)
+            cv2.circle(frame, (int(ball['pos'][0]), int(ball['pos'][1])), ball['radius'], (255, 255, 255), 2)
+
+            # Draw remaining bounce count on the ball
+            text_scale = 0.8
+            text_thickness = 2
+
+            # Center the text
+            text_size = cv2.getTextSize(bounce_text, cv2.FONT_HERSHEY_DUPLEX, text_scale, text_thickness)[0]
+            text_x = int(ball['pos'][0] - text_size[0] / 2)
+            # Adjust y for centering (text_size[1] is height)
+            text_y = int(ball['pos'][1] + text_size[1] / 2)
+
+            # Draw black outline
+            cv2.putText(frame, bounce_text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_DUPLEX, text_scale, (0, 0, 0), text_thickness + 2)
+            # Draw white text
+            cv2.putText(frame, bounce_text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_DUPLEX, text_scale, (255, 255, 255), text_thickness)
+
+            # Draw UI (Total Score and Update/Restart Text)
+        font_scale = 1.5
+        font_thickness = 4
+
+        # Total Score (Left Top)
+        cv2.putText(frame, f'{total_score}', (30, 70),
+                    cv2.FONT_HERSHEY_DUPLEX, font_scale, (255, 255, 255), font_thickness * 2)
+        cv2.putText(frame, f'{total_score}', (30, 70),
+                    cv2.FONT_HERSHEY_DUPLEX, font_scale, (0, 0, 255), font_thickness)
+
+        # Small Update/Quit Text (Right Top)
+        update_text = 'R/ESC'
+        cv2.putText(frame, update_text, (screen_width - 100, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # --- 4. DISPLAY FRAME ---
+        cv2.imshow('Face Bouncer', frame)
+
+        # --- 5. HANDLE QUIT AND MANUAL RESTART ---
+        key = cv2.waitKey(1) & 0xFF
+
+        # Quit on 'q' or ESCAPE (ASCII 27)
+        if key == ord('q') or key == 27:
+            print(f"Manual quit. Final Score: {total_score}")
+            break
+
+        # Manual restart/update on 'r'
+        elif key == ord('r'):
+            print("Manual restart/update triggered by 'r' key.")
+            restart_game()
+            break
+
+            # --- 6. CLEANUP ---
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main_game_loop()
