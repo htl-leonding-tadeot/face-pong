@@ -3,9 +3,9 @@ import numpy as np
 import random
 import math
 import time
-import subprocess  # NEW: For running shell commands
-import os          # NEW: For restarting the script
-import sys         # NEW: For restarting the script
+import subprocess  # For running shell commands
+import os          # For restarting the script
+import sys         # For restarting the script
 
 width = 1280
 height = 720
@@ -148,7 +148,7 @@ last_face_time_left = current_time
 last_face_time_right = current_time
 
 # --- NEW: Auto-Update Tracking ---
-UPDATE_CHECK_INTERVAL = 60 # 10 minutes (in seconds)
+UPDATE_CHECK_INTERVAL = 600 # 10 minutes (in seconds)
 last_update_check_time = current_time
 update_check_pending = False
 was_idle_last_frame = False # Check for transition to idle
@@ -167,6 +167,7 @@ while True:
         break
 
     img = cv2.flip(img, 1)
+    # This was the typo fix from before
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # --- Face Detection ---
@@ -242,7 +243,7 @@ while True:
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
         rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-    # --- 4d. Calculate Paddle Speeds ---
+    # --- 4d. NEW: Calculate Paddle Speeds ---
     leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
     rightPaddleSpeed = rightPaddleY - prevRightPaddleY
 
@@ -257,8 +258,10 @@ while True:
     for index, paddle_y, is_afk, paddle_speed in paddle_data:
         paddle_x = 100 + (index * paddleX)
 
+        # --- COLOR UPDATED HERE ---
+        color = (0, 165, 255) if not is_afk else (255, 0, 0) # Orange for Human, Blue for Bot
+
         # Draw paddle
-        color = (0, 0, 255) if not is_afk else (255, 0, 0) # Red for Human, Blue for Bot
         cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
 
         # Collision Check:
