@@ -3,6 +3,9 @@ import numpy as np
 import random
 import math
 import time
+import subprocess  # NEW: For running shell commands
+import os          # NEW: For restarting the script
+import sys         # NEW: For restarting the script
 
 width = 1280
 height = 720
@@ -19,6 +22,58 @@ window_name = "image"
 
 cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+
+# --- NEW: Helper function to check for git updates ---
+def check_for_update():
+    """
+    Fetches from remote, compares local and remote hashes, and pulls if different.
+    Returns True if an update was pulled, False otherwise.
+    """
+    try:
+        print("Checking for updates...")
+        # 1. Fetch updates from remote without applying them
+        subprocess.run(["git", "fetch"], check=True, capture_output=True)
+
+        # 2. Get the commit hash of the local HEAD
+        local_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        # 3. Get the commit hash of the remote branch (upstream)
+        remote_hash = subprocess.run(
+            ["git", "rev-parse", "@{u}"],
+            check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        if local_hash != remote_hash:
+            print(f"New update found (Local: {local_hash[:7]}, Remote: {remote_hash[:7]}). Pulling changes...")
+            # 4. Pull the changes
+            subprocess.run(["git", "pull"], check=True)
+            return True # Update was pulled
+        else:
+            print("No update found. Already up-to-date.")
+            return False # Already up-to-date
+
+    except subprocess.CalledProcessError as e:
+        print(f"Git command failed: {e}")
+        print("Please ensure you are in a git repository and the upstream branch is set.")
+        return False # Error, don't restart
+    except FileNotFoundError:
+        print("Git command not found. Please ensure git is installed and in your PATH.")
+        return False # Error, don't restart
+
+# --- NEW: Helper function to restart the script ---
+def restart_script():
+    """
+    Restarts the current Python script, replacing the current process.
+    """
+    print("Restarting script with new code...")
+    # os.execv replaces the current process with the new one
+    # sys.executable is the path to the current Python interpreter
+    # [sys.executable] + sys.argv passes the interpreter and original script arguments
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 class Vec:
@@ -58,12 +113,11 @@ rightScore = 0
 PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
 BALL_RADIUS = 9
-PADDLE_INFLUENCE_FACTOR = 0.5 # How much paddle speed affects ball dy
+PADDLE_INFLUENCE_FACTOR = 0.5
 
-# --- NEW: Angle Clamping Constants ---
+# --- Angle Clamping Constants ---
 MIN_ANGLE_DEG = 15
 MAX_ANGLE_DEG = 60
-# Pre-calculate tangents for efficiency
 MIN_ANGLE_TAN = math.tan(math.radians(MIN_ANGLE_DEG))
 MAX_ANGLE_TAN = math.tan(math.radians(MAX_ANGLE_DEG))
 
@@ -79,7 +133,7 @@ BOT_UPDATE_INTERVAL = 3
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
 rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
 
-# --- NEW: Previous Paddle Positions (for speed tracking) ---
+# --- Previous Paddle Positions (for speed tracking) ---
 prevLeftPaddleY = leftPaddleY
 prevRightPaddleY = rightPaddleY
 
@@ -92,6 +146,13 @@ frame_counter = 0
 current_time = time.time()
 last_face_time_left = current_time
 last_face_time_right = current_time
+
+# --- NEW: Auto-Update Tracking ---
+UPDATE_CHECK_INTERVAL = 60 # 10 minutes (in seconds)
+last_update_check_time = current_time
+update_check_pending = False
+was_idle_last_frame = False # Check for transition to idle
+
 
 # --- Center line for assignment ---
 center_x = width / 2
@@ -181,8 +242,7 @@ while True:
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
         rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-    # --- 4d. NEW: Calculate Paddle Speeds ---
-    # (This is done *after* human/bot logic moves the paddles)
+    # --- 4d. Calculate Paddle Speeds ---
     leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
     rightPaddleSpeed = rightPaddleY - prevRightPaddleY
 
@@ -210,12 +270,10 @@ while True:
                     ball.dx *= -1
                     ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
 
-                    # --- NEW: Apply Paddle Influence & Clamp Angle ---
+                    # Apply Paddle Influence & Clamp Angle
                     ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-
                     min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
                     max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-
                     sign_dy = np.sign(ball.dy)
                     clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
                     ball.dy = clamped_abs_dy * sign_dy
@@ -226,12 +284,10 @@ while True:
                     ball.dx *= -1
                     ball.x = paddle_x - BALL_RADIUS
 
-                    # --- NEW: Apply Paddle Influence & Clamp Angle ---
+                    # Apply Paddle Influence & Clamp Angle
                     ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-
                     min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
                     max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-
                     sign_dy = np.sign(ball.dy)
                     clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
                     ball.dy = clamped_abs_dy * sign_dy
@@ -247,14 +303,45 @@ while True:
 
     cv2.imshow(window_name, img)
 
-    # --- 7. Exit Condition ---
+    # --- 7. NEW: Auto-Update Logic ---
+
+    # 7a. Check if 10 minutes have passed to flag a pending update
+    if current_time - last_update_check_time > UPDATE_CHECK_INTERVAL:
+        print("10-minute interval passed. Flagging for update check.")
+        update_check_pending = True
+        last_update_check_time = current_time # Reset the 10-min timer
+
+    # 7b. Check if we should perform the update check
+    is_idle = is_afk_left and is_afk_right
+    just_became_idle = is_idle and not was_idle_last_frame
+
+    # We check if:
+    #   a) An update is pending AND the game is *already* idle
+    #   b) An update is pending AND the game *just transitioned* to idle
+    if update_check_pending and is_idle:
+
+        if just_became_idle:
+            print("Transitioned to dual bot mode with update pending. Checking now...")
+        else:
+            print("Idle mode and 10-min timer elapsed. Checking now...")
+
+        # Perform the check. If it returns True, it will restart.
+        if check_for_update():
+            restart_script() # This will stop the script
+
+        # Reset flag now that the check is done (if no update was found)
+        update_check_pending = False
+
+
+    # --- 8. Exit Condition ---
     k = cv2.waitKey(30) & 0xff
     if k == 27: # ESC key
         break
 
-    # --- 8. NEW: Update previous paddle positions for next frame ---
+    # --- 9. Update previous frame's paddle positions ---
     prevLeftPaddleY = leftPaddleY
     prevRightPaddleY = rightPaddleY
+    was_idle_last_frame = is_idle # Update idle state for next frame
 
 cap.release()
 cv2.destroyAllWindows()
