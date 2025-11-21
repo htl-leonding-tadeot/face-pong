@@ -70,7 +70,7 @@ while True:
         ball.x = int(width / 2)
         ball.y = int(height / 2)
         ball.dy = 20
-        ball.dx = -20
+        ball.dx = 20
         # add score for right player here
         rightScore = rightScore + 1
 
