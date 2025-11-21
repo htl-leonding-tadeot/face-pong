@@ -1,5 +1,7 @@
 import cv2
 import numpy as np
+import random
+import math
 
 width = 1280
 height = 720
@@ -26,14 +28,27 @@ class Vec:
         self.dy = dy
 
 
+def reset_ball(ball, speed=20):
+    """Reset ball to center with random direction within 45 degrees"""
+    ball.x = width/2
+    ball.y = height/2
+
+    # Random angle between -45 and 45 degrees
+    angle = random.uniform(-45, 45)
+    angle_rad = math.radians(angle)
+
+    # Random direction (left or right)
+    direction = random.choice([-1, 1])
+
+    # Calculate velocity components
+    ball.dx = direction * speed * math.cos(angle_rad)
+    ball.dy = speed * math.sin(angle_rad)
+
 
 paddleX = width - 230
 
 ball = Vec(100, 100, 10, 10)
-ball.x = int(width/2)
-ball.y = int(height/2)
-ball.dy = 20
-ball.dx = -20
+reset_ball(ball)
 
 leftScore = 0
 rightScore = 0
@@ -59,18 +74,12 @@ while True:
         ball.dy *= -1
 
     if ball.x > width - 5:
-        ball.x = int(width / 2)
-        ball.y = int(height / 2)
-        ball.dy = 20
-        ball.dx = -20
+        reset_ball(ball)
         # add score for left player here
         leftScore = leftScore + 1
 
     if ball.x < 0:
-        ball.x = int(width / 2)
-        ball.y = int(height / 2)
-        ball.dy = 20
-        ball.dx = -20
+        reset_ball(ball)
         # add score for right player here
         rightScore = rightScore + 1
 
@@ -94,7 +103,7 @@ while True:
             ball.x = 100 +(index * paddleX) + ((1 - index) * 30) - ball.dx
             print(ball.dx, ball.x)
 
-    cv2.circle(img, (ball.x, ball.y), 9, (0, 0, 255), -1)
+    cv2.circle(img, (int(ball.x), int(ball.y)), 9, (0, 0, 255), -1)
     text1 = cv2.putText(img, 'Left Player Score: ' + str(leftScore), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     text2 = cv2.putText(img, 'Right Player Score: ' + str(rightScore), (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     cv2.imshow(window_name, img)
