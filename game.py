@@ -63,18 +63,18 @@ BALL_RADIUS = 9
 # --- AFK Bot Constants ---
 AFK_TIMEOUT = 10.0 # Time in seconds before bot takes over
 BOT_SPEED = 12 # Max speed the bot paddle can move per frame
-BOT_DEV_RANGE = 25 # Max aiming deviation from the ball's center
-BOT_OVERSHOOT_FACTOR = 1.1 # NEW: Bot tends to move 10% further than needed (overadjustment)
-BOT_UPDATE_INTERVAL = 3 # NEW: Bot only updates its target/move every N frames (discrete steps)
+BOT_DEV_RANGE = 75 # UPDATED: Increased deviation (was 25) to make the bot miss more often!
+BOT_OVERSHOOT_FACTOR = 1.1 # Bot tends to move 10% further than needed
+BOT_UPDATE_INTERVAL = 3 # Bot only updates its target/move every N frames
 
 # --- Persistent Paddle Vertical Positions ---
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
 rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
 
 # --- Bot Target/Frame Tracking ---
-left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # NEW: Target Y for the bot
+left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
 right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2
-frame_counter = 0 # NEW: Frame counter for discrete updates
+frame_counter = 0
 
 # --- AFK Time Tracking ---
 current_time = time.time()
@@ -96,7 +96,7 @@ while True:
     img = cv2.flip(img, 1)
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # --- Face Detection & Movement ---
+    # --- Face Detection & Movement (Skipped for brevity) ---
     faces = face_cascade.detectMultiScale(gray_img, 1.25, 4)
 
     # --- 1. Ball Movement ---
@@ -131,7 +131,6 @@ while True:
             if best_right_y is None or y < best_right_y:
                 best_right_y = y
 
-    # Update persistent paddle positions and reset AFK timers
     if best_left_y is not None:
         leftPaddleY = best_left_y
         last_face_time_left = current_time
@@ -145,7 +144,7 @@ while True:
     # 4a. Update Bot Target (only runs every BOT_UPDATE_INTERVAL frames)
     if frame_counter % BOT_UPDATE_INTERVAL == 0:
 
-        # Calculate base target with random aiming deviation
+        # Calculate base target with random aiming deviation. This is the source of the miss.
         deviation = random.uniform(-BOT_DEV_RANGE, BOT_DEV_RANGE)
         base_target_y = ball.y + deviation
 
@@ -164,14 +163,9 @@ while True:
         is_afk_left = True
 
         paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
-
-        # Calculate difference and apply overshoot factor
         diff_y = (left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
-
-        # Determine movement amount, limited by BOT_SPEED
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
 
-        # Apply movement and clamp
         leftPaddleY += move_y
         leftPaddleY = np.clip(leftPaddleY, 0, height - PADDLE_HEIGHT)
         leftPaddleY = int(leftPaddleY)
@@ -183,14 +177,9 @@ while True:
         is_afk_right = True
 
         paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
-
-        # Calculate difference and apply overshoot factor
         diff_y = (right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
-
-        # Determine movement amount, limited by BOT_SPEED
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
 
-        # Apply movement and clamp
         rightPaddleY += move_y
         rightPaddleY = np.clip(rightPaddleY, 0, height - PADDLE_HEIGHT)
         rightPaddleY = int(rightPaddleY)
