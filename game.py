@@ -6,6 +6,8 @@ import math
 width = 1280
 height = 720
 
+# Make sure 'haarcascade_frontalface_default.xml' is in the same directory,
+# or provide the full path to the file.
 face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
 cap = cv2.VideoCapture(0)
@@ -19,7 +21,6 @@ cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
-
 class Vec:
     def __init__(self, x, y, dx, dy):
         self.x = x
@@ -28,7 +29,7 @@ class Vec:
         self.dy = dy
 
 
-def reset_ball(ball, speed=20):
+def reset_ball(ball, speed=15): # Reduced speed slightly for better playability
     """Reset ball to center with random direction within 45 degrees"""
     ball.x = width/2
     ball.y = height/2
@@ -45,7 +46,7 @@ def reset_ball(ball, speed=20):
     ball.dy = speed * math.sin(angle_rad)
 
 
-paddleX = width - 230
+paddleX = width - 230 # This is used to define the paddle's x-coordinate (100 + (index * paddleX))
 
 ball = Vec(100, 100, 10, 10)
 reset_ball(ball)
@@ -53,63 +54,98 @@ reset_ball(ball)
 leftScore = 0
 rightScore = 0
 
+# Define constants for collision check
+PADDLE_WIDTH = 30
+PADDLE_HEIGHT = 100
+BALL_RADIUS = 9 # Based on the drawing cv2.circle(..., 9, ...)
 
 
 while True:
     ret, img = cap.read()
+    if not ret:
+        break
+
     img = cv2.flip(img, 1)
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     faces = face_cascade.detectMultiScale(gray_img, 1.25, 4)
 
+    # --- 1. Ball Movement ---
     ball.x += ball.dx
     ball.y += ball.dy
 
-    if ball.y > height - 5:
-        ball.y = height - 5
+    # --- 2. Top/Bottom Wall Collisions ---
+    if ball.y > height - BALL_RADIUS:
+        ball.y = height - BALL_RADIUS
         ball.dy *= -1
 
-    if ball.y < 0:
-        ball.y = 0
+    if ball.y < BALL_RADIUS:
+        ball.y = BALL_RADIUS
         ball.dy *= -1
 
-    if ball.x > width - 5:
+    # --- 3. Left/Right Goal Collisions (Scoring) ---
+    if ball.x > width - BALL_RADIUS:
+        # Ball went past the right side (Left Player scores)
         reset_ball(ball)
-        # add score for left player here
         leftScore = leftScore + 1
 
-    if ball.x < 0:
+    if ball.x < BALL_RADIUS:
+        # Ball went past the left side (Right Player scores)
         reset_ball(ball)
-        # add score for right player here
         rightScore = rightScore + 1
 
     faceCords = []
 
     for (x, y, w, h) in faces:
+        # Using the Vec class to store face coordinates (x, y, w, h)
         faceCords.append(Vec(x, y, w, h))
 
+    # Sort faces by x-coordinate to consistently identify Left (index 0) and Right (index 1) players
     faceCords.sort(key=lambda c: c.x)
 
+    # --- 4. Paddle Drawing and Collision Check ---
     for index, vec in enumerate(faceCords[0:2], start=0):
-        cv2.rectangle(img, (100 + (index * paddleX), vec.y), (100 + (index * paddleX) + 30, vec.y + 100), (0, 0, 255), -1)
-        delX = abs(ball.x - (100 + (index * paddleX) + (30 * (1 - index)))) * (ball.dx / 10)
+        # Calculate paddle position
+        paddle_x = 100 + (index * paddleX)
+        paddle_y = vec.y
 
-        if ball.x == (100 + (index * paddleX) + ((1 - index) * 30)) and vec.y <= ball.y <= vec.y + 100:
-            print("bounce: ", ball.dx)
-            ball.dx *= -1
-        elif (100 + (index * paddleX)) <= ball.x + ball.dx <= (
-                100 + (index * paddleX) + ((1 - index) * 30)) and vec.y <= ball.y + ball.dy <= vec.y + 100:
-            ball.y = int(delX + ball.y)
-            ball.x = 100 +(index * paddleX) + ((1 - index) * 30) - ball.dx
-            print(ball.dx, ball.x)
+        # Draw the paddle (using PADDLE_HEIGHT/WIDTH constants)
+        cv2.rectangle(img, (paddle_x, paddle_y), (paddle_x + PADDLE_WIDTH, paddle_y + PADDLE_HEIGHT), (0, 0, 255), -1)
 
-    cv2.circle(img, (int(ball.x), int(ball.y)), 9, (0, 0, 255), -1)
+        # Collision Check: Is the ball vertically aligned with the paddle?
+        # Check if the ball's Y-range overlaps the paddle's Y-range
+        if paddle_y - BALL_RADIUS <= ball.y <= paddle_y + PADDLE_HEIGHT + BALL_RADIUS:
+
+            # Left paddle (index == 0) - Positioned on the left side
+            if index == 0:
+                # Check 1: Ball must be moving towards the paddle (left)
+                # Check 2: Ball's right edge (ball.x - BALL_RADIUS) is hitting the paddle's right edge
+                if ball.dx < 0 and (paddle_x + PADDLE_WIDTH) >= (ball.x - BALL_RADIUS) >= paddle_x:
+                    ball.dx *= -1  # Reverse horizontal direction
+                    # Reposition ball just outside the paddle's right edge
+                    ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
+                    # print("Left paddle bounce:", ball.dx) # Optional print for debugging
+
+            # Right paddle (index == 1) - Positioned on the right side
+            else:
+                # Check 1: Ball must be moving towards the paddle (right)
+                # Check 2: Ball's left edge (ball.x + BALL_RADIUS) is hitting the paddle's left edge
+                if ball.dx > 0 and paddle_x <= (ball.x + BALL_RADIUS) <= (paddle_x + PADDLE_WIDTH):
+                    ball.dx *= -1  # Reverse horizontal direction
+                    # Reposition ball just outside the paddle's left edge
+                    ball.x = paddle_x - BALL_RADIUS
+                    # print("Right paddle bounce:", ball.dx) # Optional print for debugging
+
+    # --- 5. Drawing and Display ---
+    cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
+
     text1 = cv2.putText(img, 'Left Player Score: ' + str(leftScore), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     text2 = cv2.putText(img, 'Right Player Score: ' + str(rightScore), (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     cv2.imshow(window_name, img)
 
+    # --- 6. Exit Condition ---
     k = cv2.waitKey(30) & 0xff
-    if k == 27:
+    if k == 27: # ESC key
         break
 
 cap.release()
