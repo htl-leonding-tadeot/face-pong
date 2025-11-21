@@ -7,8 +7,7 @@ import time
 width = 1280
 height = 720
 
-# Make sure 'haarcascade_frontalface_default.xml' is in the same directory,
-# or provide the full path to the file.
+# Make sure 'haarcascade_frontalface_default.xml' is in the same directory
 face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
 cap = cv2.VideoCapture(0)
@@ -31,12 +30,12 @@ class Vec:
 
 
 def reset_ball(ball, speed=15):
-    """Reset ball to center with random direction within 45 degrees"""
+    """Reset ball to center with random direction within 15 degrees"""
     ball.x = width/2
     ball.y = height/2
 
-    # Random angle between -45 and 45 degrees
-    angle = random.uniform(-45, 45)
+    # Random angle between -15 and 15 degrees
+    angle = random.uniform(-15, 15)
     angle_rad = math.radians(angle)
 
     # Random direction (left or right)
@@ -55,21 +54,34 @@ reset_ball(ball)
 leftScore = 0
 rightScore = 0
 
-# Define constants for collision check
+# --- Game & Paddle Constants ---
 PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
 BALL_RADIUS = 9
+PADDLE_INFLUENCE_FACTOR = 0.5 # How much paddle speed affects ball dy
+
+# --- NEW: Angle Clamping Constants ---
+MIN_ANGLE_DEG = 15
+MAX_ANGLE_DEG = 60
+# Pre-calculate tangents for efficiency
+MIN_ANGLE_TAN = math.tan(math.radians(MIN_ANGLE_DEG))
+MAX_ANGLE_TAN = math.tan(math.radians(MAX_ANGLE_DEG))
+
 
 # --- AFK Bot Constants ---
-AFK_TIMEOUT = 10.0 # Time in seconds before bot takes over
-BOT_SPEED = 12 # Max speed the bot paddle can move per frame
-BOT_DEV_RANGE = 75 # UPDATED: Increased deviation (was 25) to make the bot miss more often!
-BOT_OVERSHOOT_FACTOR = 1.1 # Bot tends to move 10% further than needed
-BOT_UPDATE_INTERVAL = 3 # Bot only updates its target/move every N frames
+AFK_TIMEOUT = 10.0
+BOT_SPEED = 12
+BOT_DEV_RANGE = 75
+BOT_OVERSHOOT_FACTOR = 1.1
+BOT_UPDATE_INTERVAL = 3
 
 # --- Persistent Paddle Vertical Positions ---
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
 rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
+
+# --- NEW: Previous Paddle Positions (for speed tracking) ---
+prevLeftPaddleY = leftPaddleY
+prevRightPaddleY = rightPaddleY
 
 # --- Bot Target/Frame Tracking ---
 left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
@@ -96,14 +108,14 @@ while True:
     img = cv2.flip(img, 1)
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # --- Face Detection & Movement (Skipped for brevity) ---
+    # --- Face Detection ---
     faces = face_cascade.detectMultiScale(gray_img, 1.25, 4)
 
     # --- 1. Ball Movement ---
     ball.x += ball.dx
     ball.y += ball.dy
 
-    # --- 2. Wall & Goal Collisions (Skipped for brevity) ---
+    # --- 2. Wall & Goal Collisions ---
     if ball.y > height - BALL_RADIUS:
         ball.y = height - BALL_RADIUS
         ball.dy *= -1
@@ -117,7 +129,7 @@ while True:
         reset_ball(ball)
         rightScore = rightScore + 1
 
-    # --- 3. Location-based Paddle Assignment and AFK Time Update (Human Input) ---
+    # --- 3. Location-based Paddle Assignment (Human Input) ---
     best_left_y = None
     best_right_y = None
 
@@ -139,87 +151,94 @@ while True:
         rightPaddleY = best_right_y
         last_face_time_right = current_time
 
-    # --- 4. AFK Bot Logic with Human Deviations ---
+    # --- 4. AFK Bot Logic ---
 
-    # 4a. Update Bot Target (only runs every BOT_UPDATE_INTERVAL frames)
+    # 4a. Update Bot Target
     if frame_counter % BOT_UPDATE_INTERVAL == 0:
-
-        # Calculate base target with random aiming deviation. This is the source of the miss.
         deviation = random.uniform(-BOT_DEV_RANGE, BOT_DEV_RANGE)
         base_target_y = ball.y + deviation
 
-        # Left Bot: Only track if ball is moving left (ball.dx < 0)
-        if ball.dx < 0:
+        if ball.dx < 0: # Left Bot tracks
             left_bot_target_y = base_target_y
-
-        # Right Bot: Only track if ball is moving right (ball.dx > 0)
-        if ball.dx > 0:
+        if ball.dx > 0: # Right Bot tracks
             right_bot_target_y = base_target_y
-
 
     # 4b. Left Paddle Bot Movement
     is_afk_left = False
     if current_time - last_face_time_left > AFK_TIMEOUT:
         is_afk_left = True
-
         paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
         diff_y = (left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-
-        leftPaddleY += move_y
-        leftPaddleY = np.clip(leftPaddleY, 0, height - PADDLE_HEIGHT)
-        leftPaddleY = int(leftPaddleY)
-
+        leftPaddleY = int(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
     # 4c. Right Paddle Bot Movement
     is_afk_right = False
     if current_time - last_face_time_right > AFK_TIMEOUT:
         is_afk_right = True
-
         paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
         diff_y = (right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
+        rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-        rightPaddleY += move_y
-        rightPaddleY = np.clip(rightPaddleY, 0, height - PADDLE_HEIGHT)
-        rightPaddleY = int(rightPaddleY)
+    # --- 4d. NEW: Calculate Paddle Speeds ---
+    # (This is done *after* human/bot logic moves the paddles)
+    leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
+    rightPaddleSpeed = rightPaddleY - prevRightPaddleY
 
 
-    # --- 5. Paddle Drawing and Collision Check (Skipped for brevity) ---
+    # --- 5. Paddle Drawing and Collision Check ---
 
     paddle_data = [
-        (0, leftPaddleY, is_afk_left),
-        (1, rightPaddleY, is_afk_right)
+        (0, leftPaddleY, is_afk_left, leftPaddleSpeed),
+        (1, rightPaddleY, is_afk_right, rightPaddleSpeed)
     ]
 
-    for index, paddle_y, is_afk in paddle_data:
+    for index, paddle_y, is_afk, paddle_speed in paddle_data:
         paddle_x = 100 + (index * paddleX)
 
-        # Use a different color for the bot paddle
+        # Draw paddle
         color = (0, 0, 255) if not is_afk else (255, 0, 0) # Red for Human, Blue for Bot
-
-        # Draw the paddle
         cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
 
         # Collision Check:
         if paddle_y - BALL_RADIUS <= ball.y <= paddle_y + PADDLE_HEIGHT + BALL_RADIUS:
 
-            # Left paddle (index == 0)
+            # --- Left paddle (index == 0) ---
             if index == 0:
                 if ball.dx < 0 and (paddle_x + PADDLE_WIDTH) >= (ball.x - BALL_RADIUS) >= paddle_x:
                     ball.dx *= -1
                     ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
 
-            # Right paddle (index == 1)
+                    # --- NEW: Apply Paddle Influence & Clamp Angle ---
+                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
+
+                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
+                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
+
+                    sign_dy = np.sign(ball.dy)
+                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
+                    ball.dy = clamped_abs_dy * sign_dy
+
+            # --- Right paddle (index == 1) ---
             else:
                 if ball.dx > 0 and paddle_x <= (ball.x + BALL_RADIUS) <= (paddle_x + PADDLE_WIDTH):
                     ball.dx *= -1
                     ball.x = paddle_x - BALL_RADIUS
 
+                    # --- NEW: Apply Paddle Influence & Clamp Angle ---
+                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
+
+                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
+                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
+
+                    sign_dy = np.sign(ball.dy)
+                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
+                    ball.dy = clamped_abs_dy * sign_dy
+
     # --- 6. Drawing and Display ---
     cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
 
-    # Display Score and AFK status
     left_status = "Bot" if is_afk_left else "Human"
     right_status = "Bot" if is_afk_right else "Human"
 
@@ -232,6 +251,10 @@ while True:
     k = cv2.waitKey(30) & 0xff
     if k == 27: # ESC key
         break
+
+    # --- 8. NEW: Update previous paddle positions for next frame ---
+    prevLeftPaddleY = leftPaddleY
+    prevRightPaddleY = rightPaddleY
 
 cap.release()
 cv2.destroyAllWindows()
