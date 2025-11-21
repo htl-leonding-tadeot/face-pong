@@ -24,9 +24,9 @@ MAX_BALL_BOUNCES = 5 # Max bounces allowed before ball is removed
 INACTIVITY_TIMEOUT_SEC = 60.0 # Time (in seconds) with no faces detected before restart
 
 # Player Tracking Configuration (FOR STABILITY)
-# Increased tolerance: Max 300 pixels movement per frame before losing track of a player
-MAX_DISTANCE_SQUARED = 90000 # Increased from 25600 (160px) to 90000 (300px) for better stability
-DECAY_TIMEOUT = 5.0          # Seconds before an unseen player is removed (increased from 3.0s)
+TRACKING_SMOOTHING_FACTOR = 0.5 # New: Lower value means more smoothing, higher means more raw movement.
+MAX_DISTANCE_SQUARED = 90000 # Max 300 pixels movement per frame before losing track of a player
+DECAY_TIMEOUT = 2.0          # Reduced: Seconds before an unseen player is removed (down from 5.0s)
 MIN_CONSECUTIVE_DETECTIONS = 3 # Frames required to confirm a new player
 
 # --- GAME STATE ---
@@ -111,6 +111,9 @@ def track_faces(new_faces, current_time):
     new_pending_faces = {}
     unmatched_new_faces = list(new_faces)
 
+    # Smoothing factor for player movement
+    factor = TRACKING_SMOOTHING_FACTOR
+
     # --- 1. Match new faces to ACTIVE players (Green, Scored) ---
     for player_id, player in players.items():
         best_match_index = -1
@@ -129,7 +132,18 @@ def track_faces(new_faces, current_time):
         if best_match_index != -1:
             # Match found for active player: Update position and remove face from pool
             new_face_rect = unmatched_new_faces.pop(best_match_index)
-            player['face_rect'] = new_face_rect
+
+            # Apply Smoothing (Linear Interpolation)
+            old_x, old_y, old_w, old_h = player['face_rect']
+            new_x, new_y, new_w, new_h = new_face_rect
+
+            smoothed_x = int(old_x * (1 - factor) + new_x * factor)
+            smoothed_y = int(old_y * (1 - factor) + new_y * factor)
+            smoothed_w = int(old_w * (1 - factor) + new_w * factor)
+            smoothed_h = int(old_h * (1 - factor) + new_h * factor)
+
+            player['face_rect'] = (smoothed_x, smoothed_y, smoothed_w, smoothed_h)
+
             player['last_seen_time'] = current_time
             matched_players[player_id] = player
 
@@ -153,7 +167,17 @@ def track_faces(new_faces, current_time):
             # Match found for pending face: Increment count and remove face from pool
             new_rect = unmatched_new_faces.pop(best_match_index)
             pending['count'] += 1
-            pending['face_rect'] = new_rect
+
+            # Apply Smoothing for pending faces as well
+            old_x, old_y, old_w, old_h = pending['face_rect']
+            new_x, new_y, new_w, new_h = new_rect
+
+            smoothed_x = int(old_x * (1 - factor) + new_x * factor)
+            smoothed_y = int(old_y * (1 - factor) + new_y * factor)
+            smoothed_w = int(old_w * (1 - factor) + new_w * factor)
+            smoothed_h = int(old_h * (1 - factor) + new_h * factor)
+
+            pending['face_rect'] = (smoothed_x, smoothed_y, smoothed_w, smoothed_h)
             pending['last_seen_time'] = current_time
 
             if pending['count'] >= MIN_CONSECUTIVE_DETECTIONS:
@@ -162,12 +186,10 @@ def track_faces(new_faces, current_time):
                 new_player = {
                     'score': 0,
                     'last_seen_time': current_time,
-                    'face_rect': new_rect
+                    'face_rect': pending['face_rect'] # Use the final smoothed position
                 }
                 matched_players[next_player_id] = new_player
                 next_player_id += 1
-                # NOTE: The promoted player is removed from the pending pool implicitly
-                # because we only add non-promoted faces to new_pending_faces below.
             else:
                 # Still pending, keep tracking (Add to the next frame's pending list)
                 new_pending_faces[temp_id] = pending
@@ -252,6 +274,7 @@ def main_game_loop():
         # --- 2. GAME LOGIC ---
 
         # Check for new ball spawn (Score-based increase)
+        # FIX: Corrected typo from SCORE_BALL_TO_ADD to SCORE_TO_ADD_BALL
         if total_score > 0 and total_score // SCORE_TO_ADD_BALL > last_ball_spawn_score and len(balls) < MAX_BALLS:
             spawn_ball(screen_width)
             last_ball_spawn_score = total_score // SCORE_TO_ADD_BALL
@@ -347,8 +370,6 @@ def main_game_loop():
                 continue
 
                 # --- 3. DRAWING ---
-
-        # Note: Drawing of pending faces (yellow rects) removed as requested.
 
         # Draw all confirmed players (Green border, with score)
         for player_id, player in players.items():
