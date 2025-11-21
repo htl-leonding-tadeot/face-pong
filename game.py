@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import random
 import math
+import time # Import time for AFK tracking
 
 width = 1280
 height = 720
@@ -22,7 +23,6 @@ cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREE
 
 
 class Vec:
-    # Used for both ball movement (x, y, dx, dy) and face coordinates (x, y, w, h)
     def __init__(self, x, y, dx, dy):
         self.x = x
         self.y = y
@@ -47,7 +47,7 @@ def reset_ball(ball, speed=15):
     ball.dy = speed * math.sin(angle_rad)
 
 
-paddleX = width - 230 # Used to define the paddle's x-coordinate (100 + (index * paddleX))
+paddleX = width - 230
 
 ball = Vec(100, 100, 10, 10)
 reset_ball(ball)
@@ -58,15 +58,29 @@ rightScore = 0
 # Define constants for collision check
 PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
-BALL_RADIUS = 9 # Based on the drawing cv2.circle(..., 9, ...)
+BALL_RADIUS = 9
 
-# --- NEW: Persistent paddle vertical positions ---
-# Initialize both paddles to the vertical center of the screen
+# --- AFK Bot Constants ---
+AFK_TIMEOUT = 10.0 # Time in seconds before bot takes over
+BOT_SPEED = 15 # Speed at which the bot paddle moves
+
+# --- Persistent Paddle Vertical Positions ---
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
 rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
 
+# --- AFK Time Tracking ---
+# Initialize the last time a face was seen to the current time
+current_time = time.time()
+last_face_time_left = current_time
+last_face_time_right = current_time
+
+# --- Center line for assignment ---
+center_x = width / 2
+
 
 while True:
+    current_time = time.time() # Get current time at the start of the loop
+
     ret, img = cap.read()
     if not ret:
         break
@@ -92,76 +106,124 @@ while True:
 
     # --- 3. Left/Right Goal Collisions (Scoring) ---
     if ball.x > width - BALL_RADIUS:
-        # Ball went past the right side (Left Player scores)
         reset_ball(ball)
         leftScore = leftScore + 1
 
     if ball.x < BALL_RADIUS:
-        # Ball went past the left side (Right Player scores)
         reset_ball(ball)
         rightScore = rightScore + 1
 
-    # --- 4. Update Persistent Paddle Positions based on detected faces ---
-    faceCords = []
+    # --- 4. Location-based Paddle Assignment and AFK Time Update ---
+    best_left_y = None
+    best_right_y = None
+
     for (x, y, w, h) in faces:
-        faceCords.append(Vec(x, y, w, h))
+        face_center_x = x + w / 2
 
-    # Sort faces by x-coordinate to consistently identify Left (index 0) and Right (index 1) players
-    faceCords.sort(key=lambda c: c.x)
+        if face_center_x < center_x:
+            if best_left_y is None or y < best_left_y:
+                best_left_y = y
+        else:
+            if best_right_y is None or y < best_right_y:
+                best_right_y = y
 
-    for index, vec in enumerate(faceCords[0:2], start=0):
-        # The face's y-coordinate (vec.y) is the new paddle position
-        if index == 0:
-            # Update the Left paddle's position
-            leftPaddleY = vec.y
-        else: # index == 1
-            # Update the Right paddle's position
-            rightPaddleY = vec.y
+    # Update persistent paddle positions and reset AFK timers
+    if best_left_y is not None:
+        leftPaddleY = best_left_y
+        last_face_time_left = current_time # Reset timer
 
-    # --- 5. Paddle Drawing and Collision Check (Using persistent Y values) ---
+    if best_right_y is not None:
+        rightPaddleY = best_right_y
+        last_face_time_right = current_time # Reset timer
 
-    # Paddle data structure: (index, paddle_y_position)
+    # --- 5. AFK Bot Logic ---
+
+    # Target Y is the center of the ball
+    target_y = int(ball.y)
+
+    # Left Paddle Bot
+    if current_time - last_face_time_left > AFK_TIMEOUT:
+        is_afk_left = True
+        # Calculate the direction and magnitude to move the paddle
+        paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
+        diff_y = target_y - paddle_center_y
+
+        # Determine movement amount (clamped by BOT_SPEED)
+        move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
+
+        # Apply movement
+        leftPaddleY += move_y
+
+        # Clamp paddle position within screen bounds
+        leftPaddleY = np.clip(leftPaddleY, 0, height - PADDLE_HEIGHT)
+
+    else:
+        is_afk_left = False
+
+    # Right Paddle Bot
+    if current_time - last_face_time_right > AFK_TIMEOUT:
+        is_afk_right = True
+        # Calculate the direction and magnitude to move the paddle
+        paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
+        diff_y = target_y - paddle_center_y
+
+        # Determine movement amount (clamped by BOT_SPEED)
+        move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
+
+        # Apply movement
+        rightPaddleY += move_y
+
+        # Clamp paddle position within screen bounds
+        rightPaddleY = np.clip(rightPaddleY, 0, height - PADDLE_HEIGHT)
+
+    else:
+        is_afk_right = False
+
+
+    # --- 6. Paddle Drawing and Collision Check ---
+
     paddle_data = [
-        (0, leftPaddleY),
-        (1, rightPaddleY)
+        (0, leftPaddleY, is_afk_left),
+        (1, rightPaddleY, is_afk_right)
     ]
 
-    for index, paddle_y in paddle_data:
-        # The X position is fixed for both paddles
+    for index, paddle_y, is_afk in paddle_data:
         paddle_x = 100 + (index * paddleX)
 
-        # Draw the paddle
-        cv2.rectangle(img, (paddle_x, paddle_y), (paddle_x + PADDLE_WIDTH, paddle_y + PADDLE_HEIGHT), (0, 0, 255), -1)
+        # Use a different color for the bot paddle
+        color = (0, 0, 255) if not is_afk else (255, 0, 0) # Red for Human, Blue for Bot
 
-        # Collision Check: Is the ball vertically aligned with the paddle?
+        # Draw the paddle
+        cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
+
+        # Collision Check:
         if paddle_y - BALL_RADIUS <= ball.y <= paddle_y + PADDLE_HEIGHT + BALL_RADIUS:
 
-            # Left paddle (index == 0) - Positioned on the left side
+            # Left paddle (index == 0)
             if index == 0:
-                # Check 1: Ball must be moving towards the paddle (left, ball.dx < 0)
-                # Check 2: Ball's right edge (ball.x - BALL_RADIUS) is hitting the paddle's right edge
                 if ball.dx < 0 and (paddle_x + PADDLE_WIDTH) >= (ball.x - BALL_RADIUS) >= paddle_x:
-                    ball.dx *= -1  # Reverse horizontal direction
-                    # Reposition ball just outside the paddle's right edge
+                    ball.dx *= -1
                     ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
 
-            # Right paddle (index == 1) - Positioned on the right side
+            # Right paddle (index == 1)
             else:
-                # Check 1: Ball must be moving towards the paddle (right, ball.dx > 0)
-                # Check 2: Ball's left edge (ball.x + BALL_RADIUS) is hitting the paddle's left edge
                 if ball.dx > 0 and paddle_x <= (ball.x + BALL_RADIUS) <= (paddle_x + PADDLE_WIDTH):
-                    ball.dx *= -1  # Reverse horizontal direction
-                    # Reposition ball just outside the paddle's left edge
+                    ball.dx *= -1
                     ball.x = paddle_x - BALL_RADIUS
 
-    # --- 6. Drawing and Display ---
+    # --- 7. Drawing and Display ---
     cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
 
-    text1 = cv2.putText(img, 'Left Player Score: ' + str(leftScore), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-    text2 = cv2.putText(img, 'Right Player Score: ' + str(rightScore), (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    # Display Score and AFK status
+    left_status = "Bot" if is_afk_left else "Human"
+    right_status = "Bot" if is_afk_right else "Human"
+
+    text1 = cv2.putText(img, f'L ({left_status}): {leftScore}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    text2 = cv2.putText(img, f'R ({right_status}): {rightScore}', (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+
     cv2.imshow(window_name, img)
 
-    # --- 7. Exit Condition ---
+    # --- 8. Exit Condition ---
     k = cv2.waitKey(30) & 0xff
     if k == 27: # ESC key
         break
