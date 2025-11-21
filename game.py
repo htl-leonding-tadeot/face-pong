@@ -82,7 +82,7 @@ while True:
     faceCords.sort(key=lambda c: c.x)
 
     for index, vec in enumerate(faceCords[0:2], start=0):
-        cv2.rectangle(img, (100 + (index * paddleX), vec.y), (100 + (index * paddleX) + 30, vec.y + 100), (100, 100, 0), 1)
+        cv2.rectangle(img, (100 + (index * paddleX), vec.y), (100 + (index * paddleX) + 30, vec.y + 100), (0, 0, 255), -1)
         delX = abs(ball.x - (100 + (index * paddleX) + (30 * (1 - index)))) * (ball.dx / 10)
 
         if ball.x == (100 + (index * paddleX) + ((1 - index) * 30)) and vec.y <= ball.y <= vec.y + 100:
