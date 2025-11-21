@@ -24,7 +24,7 @@ cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
-# --- NEW: Helper function to check for git updates ---
+# --- Helper function to check for git updates ---
 def check_for_update():
     """
     Fetches from remote, compares local and remote hashes, and pulls if different.
@@ -64,15 +64,12 @@ def check_for_update():
         print("Git command not found. Please ensure git is installed and in your PATH.")
         return False # Error, don't restart
 
-# --- NEW: Helper function to restart the script ---
+# --- Helper function to restart the script ---
 def restart_script():
     """
     Restarts the current Python script, replacing the current process.
     """
     print("Restarting script with new code...")
-    # os.execv replaces the current process with the new one
-    # sys.executable is the path to the current Python interpreter
-    # [sys.executable] + sys.argv passes the interpreter and original script arguments
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -128,6 +125,7 @@ BOT_SPEED = 12
 BOT_DEV_RANGE = 75
 BOT_OVERSHOOT_FACTOR = 1.1
 BOT_UPDATE_INTERVAL = 3
+BOT_SMOOTHING_FACTOR = 0.2 # NEW: (e.g., 0.2 = 20% smoothing per frame)
 
 # --- Persistent Paddle Vertical Positions ---
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
@@ -138,8 +136,10 @@ prevLeftPaddleY = leftPaddleY
 prevRightPaddleY = rightPaddleY
 
 # --- Bot Target/Frame Tracking ---
-left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
-right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2
+raw_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # RENAMED
+raw_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # RENAMED
+smooth_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # NEW
+smooth_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # NEW
 frame_counter = 0
 
 # --- AFK Time Tracking ---
@@ -147,7 +147,7 @@ current_time = time.time()
 last_face_time_left = current_time
 last_face_time_right = current_time
 
-# --- NEW: Auto-Update Tracking ---
+# --- Auto-Update Tracking ---
 UPDATE_CHECK_INTERVAL = 600 # 10 minutes (in seconds)
 last_update_check_time = current_time
 update_check_pending = False
@@ -167,7 +167,6 @@ while True:
         break
 
     img = cv2.flip(img, 1)
-    # This was the typo fix from before
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # --- Face Detection ---
@@ -215,35 +214,44 @@ while True:
 
     # --- 4. AFK Bot Logic ---
 
-    # 4a. Update Bot Target
+    # 4a. Update Bot's RAW Target (Reaction Time)
+    # This still only runs every few frames, simulating human reaction delay
     if frame_counter % BOT_UPDATE_INTERVAL == 0:
         deviation = random.uniform(-BOT_DEV_RANGE, BOT_DEV_RANGE)
         base_target_y = ball.y + deviation
 
         if ball.dx < 0: # Left Bot tracks
-            left_bot_target_y = base_target_y
+            raw_left_bot_target_y = base_target_y
         if ball.dx > 0: # Right Bot tracks
-            right_bot_target_y = base_target_y
+            raw_right_bot_target_y = base_target_y
 
-    # 4b. Left Paddle Bot Movement
+    # 4b. NEW: Update Bot's SMOOTH Target (Movement Fluidity)
+    # This runs every frame, making the bot's goal glide smoothly
+    smooth_left_bot_target_y = (smooth_left_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_left_bot_target_y * BOT_SMOOTHING_FACTOR)
+    smooth_right_bot_target_y = (smooth_right_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_right_bot_target_y * BOT_SMOOTHING_FACTOR)
+
+
+    # 4c. Left Paddle Bot Movement
     is_afk_left = False
     if current_time - last_face_time_left > AFK_TIMEOUT:
         is_afk_left = True
         paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
-        diff_y = (left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
+        # Use the SMOOTH target for movement
+        diff_y = (smooth_left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
         leftPaddleY = int(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-    # 4c. Right Paddle Bot Movement
+    # 4d. Right Paddle Bot Movement
     is_afk_right = False
     if current_time - last_face_time_right > AFK_TIMEOUT:
         is_afk_right = True
         paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
-        diff_y = (right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
+        # Use the SMOOTH target for movement
+        diff_y = (smooth_right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
         rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-    # --- 4d. NEW: Calculate Paddle Speeds ---
+    # 4e. Calculate Paddle Speeds
     leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
     rightPaddleSpeed = rightPaddleY - prevRightPaddleY
 
@@ -258,8 +266,8 @@ while True:
     for index, paddle_y, is_afk, paddle_speed in paddle_data:
         paddle_x = 100 + (index * paddleX)
 
-        # --- COLOR UPDATED HERE ---
-        color = (0, 165, 255) if not is_afk else (255, 0, 0) # Orange for Human, Blue for Bot
+        # Orange for Human, Blue for Bot
+        color = (0, 165, 255) if not is_afk else (255, 0, 0)
 
         # Draw paddle
         cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
@@ -306,7 +314,7 @@ while True:
 
     cv2.imshow(window_name, img)
 
-    # --- 7. NEW: Auto-Update Logic ---
+    # --- 7. Auto-Update Logic ---
 
     # 7a. Check if 10 minutes have passed to flag a pending update
     if current_time - last_update_check_time > UPDATE_CHECK_INTERVAL:
@@ -318,9 +326,6 @@ while True:
     is_idle = is_afk_left and is_afk_right
     just_became_idle = is_idle and not was_idle_last_frame
 
-    # We check if:
-    #   a) An update is pending AND the game is *already* idle
-    #   b) An update is pending AND the game *just transitioned* to idle
     if update_check_pending and is_idle:
 
         if just_became_idle:
@@ -328,11 +333,9 @@ while True:
         else:
             print("Idle mode and 10-min timer elapsed. Checking now...")
 
-        # Perform the check. If it returns True, it will restart.
         if check_for_update():
             restart_script() # This will stop the script
 
-        # Reset flag now that the check is done (if no update was found)
         update_check_pending = False
 
 
