@@ -31,6 +31,12 @@ BLOCK_COLS = 10
 BLOCK_HEIGHT = 30
 POINTS_PER_BLOCK = 10
 
+# Fraction of the frame held out of play on each side. The paddle follows the
+# face, and a face near the frame edge is both hard to reach and hard to
+# detect, so the walls sit where a player can comfortably get to them.
+PLAYFIELD_MARGIN = 0.15
+MIN_BOUNCE_ANGLE = 20   # degrees off horizontal, so rallies never flatten out
+
 # Auto-Restart Configuration
 INACTIVITY_TIMEOUT_SEC = 60.0
 RESTART_ON_WIN = True
@@ -70,25 +76,31 @@ def restart_game(screen_width, screen_height):
     create_blocks(screen_width, screen_height)
     spawn_ball(screen_width, screen_height)
 
+def playfield(screen_width):
+    """Left and right walls of the play area."""
+    margin = round(screen_width * PLAYFIELD_MARGIN)
+    return margin, screen_width - margin
+
+
 def create_blocks(screen_width, screen_height):
-    """Generates the grid of blocks."""
+    """Generates the grid of blocks, filling the play area exactly."""
     global blocks
     blocks = []
 
-    # Calculate margin to center blocks
-    total_block_width = screen_width // BLOCK_COLS
+    field_left, field_right = playfield(screen_width)
+    block_width = (field_right - field_left) / BLOCK_COLS
 
     colors = [(255, 0, 0), (255, 165, 0), (255, 255, 0), (0, 255, 0), (0, 127, 255), (139, 0, 255)]
 
     for row in range(BLOCK_ROWS):
         color = colors[row % len(colors)]
         for col in range(BLOCK_COLS):
-            b_x = col * total_block_width
+            b_x = field_left + col * block_width
             b_y = row * BLOCK_HEIGHT + 60 # 60px buffer from top
 
             # Add a small gap between blocks
             blocks.append({
-                'rect': [b_x + 2, b_y + 2, total_block_width - 4, BLOCK_HEIGHT - 4],
+                'rect': [b_x + 2, b_y + 2, block_width - 4, BLOCK_HEIGHT - 4],
                 'color': color,
                 'active': True
             })
@@ -337,7 +349,7 @@ def main_game_loop():
 
         # Detect on a downscaled copy (4x cheaper), then map the rects back up
         small = cv2.resize(gray, None, fx=DETECT_SCALE, fy=DETECT_SCALE, interpolation=cv2.INTER_AREA)
-        min_size = max(20, int(screen_height * 0.08 * DETECT_SCALE))
+        min_size = max(20, int(screen_height * 0.05 * DETECT_SCALE))
         new_faces = [(int(x / DETECT_SCALE), int(y / DETECT_SCALE),
                       int(w / DETECT_SCALE), int(h / DETECT_SCALE))
                      for x, y, w, h in face_cascade.detectMultiScale(
@@ -356,7 +368,17 @@ def main_game_loop():
 
         # --- GAME LOGIC ---
 
-        # 1. Update Ball Positions
+        field_left, field_right = playfield(screen_width)
+        paddle_y = screen_height - PADDLE_Y_OFFSET
+
+        # 1. Place every paddle under its player's face, once per frame
+        for player in players.values():
+            fx, fy, fw, fh = player['face_rect']
+            paddle_x = fx + fw // 2 - PADDLE_WIDTH // 2
+            paddle_x = max(field_left, min(field_right - PADDLE_WIDTH, paddle_x))
+            player['paddle_rect'] = (paddle_x, paddle_y, PADDLE_WIDTH, PADDLE_HEIGHT)
+
+        # 2. Update Ball Positions
         # Velocities are per second, so the ball moves at the same speed no
         # matter how fast the machine renders. A hitch longer than a tenth of a
         # second is clamped, since a step that big could skip past a paddle;
@@ -372,11 +394,11 @@ def main_game_loop():
             br = ball['radius']
 
             # Wall Collisions
-            if bx - br <= 0:
-                ball['pos'][0] = br
+            if bx - br <= field_left:
+                ball['pos'][0] = field_left + br
                 ball['vel'][0] *= -1
-            elif bx + br >= screen_width:
-                ball['pos'][0] = screen_width - br
+            elif bx + br >= field_right:
+                ball['pos'][0] = field_right - br
                 ball['vel'][0] *= -1
 
             if by - br <= 0:
@@ -402,6 +424,10 @@ def main_game_loop():
                 if col_type:
                     block['active'] = False
                     game_score += POINTS_PER_BLOCK
+                    # Credit whoever last hit this ball
+                    owner = players.get(ball.get('owner'))
+                    if owner:
+                        owner['score'] = owner.get('score', 0) + POINTS_PER_BLOCK
                     hit_block = True
 
                     if col_type == 'y':
@@ -413,21 +439,8 @@ def main_game_loop():
             if hit_block: continue
 
             # Paddle Collisions (Players)
-            paddle_y = screen_height - PADDLE_Y_OFFSET
-
             for pid, player in players.items():
-                fx, fy, fw, fh = player['face_rect']
-
-                # Map face X to Paddle X
-                # Center of face controls center of paddle
-                face_center_x = fx + fw // 2
-                paddle_x = face_center_x - (PADDLE_WIDTH // 2)
-
-                # Constrain to screen
-                paddle_x = max(0, min(screen_width - PADDLE_WIDTH, paddle_x))
-
-                # Store paddle pos in player object for drawing later
-                player['paddle_rect'] = (paddle_x, paddle_y, PADDLE_WIDTH, PADDLE_HEIGHT)
+                paddle_x, paddle_y, _, _ = player['paddle_rect']
 
                 # Collision Check
                 col_type = check_aabb_collision(ball['pos'][0], ball['pos'][1], br,
@@ -437,6 +450,7 @@ def main_game_loop():
                     # Determine hit position relative to paddle center (-1 to 1)
                     paddle_center = paddle_x + PADDLE_WIDTH / 2
                     hit_pos = (ball['pos'][0] - paddle_center) / (PADDLE_WIDTH / 2)
+                    ball['owner'] = pid
 
                     # Reflect Y (always bounce up)
                     ball['vel'][1] = -abs(ball['vel'][1])
@@ -448,8 +462,12 @@ def main_game_loop():
                     # Adjust X velocity based on where it hit
                     new_vel_x = ball['vel'][0] + (hit_pos * current_speed * 0.5)
 
-                    # Normalize speed to keep it constant
+                    # Keep the bounce clear of horizontal, or the ball spends an
+                    # age skimming between the walls. Upward is a negative angle.
                     angle = math.atan2(ball['vel'][1], new_vel_x)
+                    limit = math.radians(MIN_BOUNCE_ANGLE)
+                    angle = max(-math.pi + limit, min(-limit, angle))
+
                     ball['vel'][0] = current_speed * math.cos(angle)
                     ball['vel'][1] = current_speed * math.sin(angle)
 
@@ -467,6 +485,12 @@ def main_game_loop():
             restart_game(screen_width, screen_height)
 
         # --- DRAWING ---
+
+        # Dim what is out of play, so it reads as the edge of the court
+        frame[:, :field_left] = (frame[:, :field_left] * 0.45).astype(np.uint8)
+        frame[:, field_right:] = (frame[:, field_right:] * 0.45).astype(np.uint8)
+        cv2.line(frame, (field_left, 0), (field_left, screen_height), (255, 255, 255), 3)
+        cv2.line(frame, (field_right, 0), (field_right, screen_height), (255, 255, 255), 3)
 
         # Draw Blocks
         for block in blocks:
@@ -495,7 +519,8 @@ def main_game_loop():
                 cv2.rectangle(frame, (int(px), int(py)), (int(px+pw), int(py+ph)), color, -1)
                 cv2.rectangle(frame, (int(px), int(py)), (int(px+pw), int(py+ph)), (255,255,255), 2)
 
-                cv2.putText(frame, f"P{pid}", (int(px), int(py)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                label = f"P{pid}  {player.get('score', 0)}"
+                cv2.putText(frame, label, (int(px), int(py)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # Draw Balls
         for ball in balls:
