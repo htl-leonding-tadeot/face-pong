@@ -1,8 +1,17 @@
+import os
+
+# OpenCV's GTK window can be much slower on GTK's Wayland backend than through
+# XWayland (42ms vs 6ms per fullscreen frame on an Apple M-series laptop), so
+# prefer X11 when an X display is reachable. Must happen before the first window.
+if os.environ.get('WAYLAND_DISPLAY') and os.environ.get('DISPLAY'):
+    os.environ.setdefault('GDK_BACKEND', 'x11')
+
 import cv2
+import math
 import numpy as np
+import threading
 import random
 import time
-import os
 import sys
 
 # --- CONFIGURATION ---
@@ -11,8 +20,8 @@ import sys
 CASCADE_PATH = r'./haarcascade_frontalface_default.xml'
 
 # Game settings
-BALL_RADIUS = 12
-BALL_SPEED = 15
+BALL_RADIUS = 12        # at 720p; scaled for other resolutions
+BALL_SPEED = 0.35       # screen heights per second
 MAX_BALLS = 3
 PADDLE_WIDTH = 120
 PADDLE_HEIGHT = 20
@@ -25,6 +34,9 @@ POINTS_PER_BLOCK = 10
 # Auto-Restart Configuration
 INACTIVITY_TIMEOUT_SEC = 60.0
 RESTART_ON_WIN = True
+
+# Latency Configuration
+DETECT_SCALE = 0.4      # face detection runs on a frame this much smaller
 
 # Player Tracking Configuration (Kept from previous code)
 TRACKING_SMOOTHING_FACTOR = 0.4
@@ -43,10 +55,20 @@ game_score = 0
 
 # --- HELPER FUNCTIONS ---
 
-def restart_game():
-    """Restarts the current Python script process."""
+def restart_game(screen_width, screen_height):
+    """Resets the game back to its starting state.
+
+    This used to re-exec the interpreter, which left the camera device open in
+    the dying process and so failed to reopen it.
+    """
+    global balls, players, pending_faces, game_score
     print("--- GAME RESTARTING ---")
-    os.execv(sys.executable, ['python'] + sys.argv)
+    balls = []
+    players = {}
+    pending_faces = {}
+    game_score = 0
+    create_blocks(screen_width, screen_height)
+    spawn_ball(screen_width, screen_height)
 
 def create_blocks(screen_width, screen_height):
     """Generates the grid of blocks."""
@@ -81,16 +103,64 @@ def spawn_ball(screen_width, screen_height):
 
         # Randomize angle downwards
         angle = random.uniform(math.pi/4, 3*math.pi/4)
-        vel_x = BALL_SPEED * math.cos(angle)
-        vel_y = BALL_SPEED * math.sin(angle)
-
+        speed = BALL_SPEED * screen_height
         new_ball = {
             'pos': [start_x, start_y],
-            'vel': [vel_x, vel_y],
+            'vel': [speed * math.cos(angle), speed * math.sin(angle)],
             'radius': BALL_RADIUS,
             'color': (255, 255, 255)
         }
         balls.append(new_ball)
+
+def scale_to_frame(screen_height):
+    """Scales the pixel sizes, which are tuned for 720p, to the camera's frame.
+
+    Whatever resolution the camera gives us, the game should look the same.
+    """
+    global BALL_RADIUS, PADDLE_WIDTH, PADDLE_HEIGHT, PADDLE_Y_OFFSET
+    global BLOCK_HEIGHT, MAX_DISTANCE_SQUARED
+    factor = screen_height / 720
+    BALL_RADIUS = max(4, round(BALL_RADIUS * factor))
+    PADDLE_WIDTH = round(PADDLE_WIDTH * factor)
+    PADDLE_HEIGHT = max(4, round(PADDLE_HEIGHT * factor))
+    PADDLE_Y_OFFSET = round(PADDLE_Y_OFFSET * factor)
+    BLOCK_HEIGHT = max(8, round(BLOCK_HEIGHT * factor))
+    MAX_DISTANCE_SQUARED = round(MAX_DISTANCE_SQUARED * factor * factor)
+
+
+class Camera:
+    """Camera that always hands back the newest frame.
+
+    The game loop is slower than the camera's 30 fps. Reading in the loop means
+    the driver's buffers stay full and read() returns a frame that is several
+    frames old; worse, the loop then blocks waiting its turn. A thread that
+    does nothing but read keeps those buffers drained, so the loop gets the
+    live frame without waiting.
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.ok, self.frame = cap.read()
+        self.running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while self.running:
+            ok, frame = self.cap.read()
+            with self.lock:
+                self.ok, self.frame = ok, frame
+            if not ok:
+                break
+
+    def read(self):
+        with self.lock:
+            return self.ok, self.frame
+
+    def release(self):
+        self.running = False
+        self.cap.release()
+
 
 def init_game():
     """Initializes the game window and camera."""
@@ -99,20 +169,29 @@ def init_game():
         print(f"CRITICAL ERROR: Could not load face cascade from '{CASCADE_PATH}'")
         return None, None, None, None
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    # First index that actually delivers a frame. Index 0 is not always a camera
+    # (on Linux it can be e.g. a hardware video decoder), so try a few.
+    backend = cv2.CAP_V4L2 if sys.platform.startswith('linux') else cv2.CAP_ANY
+    for index in range(5):
+        cap = cv2.VideoCapture(index, backend)
+        # Attempt HD resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened() and cap.read()[0]:
+            break
+        cap.release()
+    else:
         print("CRITICAL ERROR: Could not open video camera.")
         return None, None, None, None
 
-    # Attempt HD resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
+    cap = Camera(cap)
     ret, frame = cap.read()
     if not ret:
         return None, None, None, None
 
     screen_height, screen_width = frame.shape[:2]
+    scale_to_frame(screen_height)
     cv2.namedWindow('Face Breaker', cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty('Face Breaker', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -214,8 +293,6 @@ def track_faces(new_faces, current_time):
     players = final_players
     pending_faces = new_pending_faces
 
-import math
-
 def check_aabb_collision(ball_x, ball_y, ball_r, rect_x, rect_y, rect_w, rect_h):
     """
     Simple AABB collision detection.
@@ -249,6 +326,7 @@ def main_game_loop():
     if cap is None: return
 
     last_activity_time = time.time()
+    last_frame_time = last_activity_time
 
     while True:
         ret, frame = cap.read()
@@ -257,8 +335,13 @@ def main_game_loop():
         frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Detect
-        new_faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+        # Detect on a downscaled copy (4x cheaper), then map the rects back up
+        small = cv2.resize(gray, None, fx=DETECT_SCALE, fy=DETECT_SCALE, interpolation=cv2.INTER_AREA)
+        min_size = max(20, int(screen_height * 0.08 * DETECT_SCALE))
+        new_faces = [(int(x / DETECT_SCALE), int(y / DETECT_SCALE),
+                      int(w / DETECT_SCALE), int(h / DETECT_SCALE))
+                     for x, y, w, h in face_cascade.detectMultiScale(
+                         small, 1.2, 5, minSize=(min_size, min_size))]
         current_time = time.time()
 
         # Track
@@ -268,14 +351,22 @@ def main_game_loop():
         if len(players) > 0:
             last_activity_time = current_time
         elif current_time - last_activity_time > INACTIVITY_TIMEOUT_SEC:
-            restart_game()
+            restart_game(screen_width, screen_height)
+            last_activity_time = current_time
 
         # --- GAME LOGIC ---
 
         # 1. Update Ball Positions
+        # Velocities are per second, so the ball moves at the same speed no
+        # matter how fast the machine renders. A hitch longer than a tenth of a
+        # second is clamped, since a step that big could skip past a paddle;
+        # below ~10 fps the ball goes slow-motion rather than through things.
+        dt = min(current_time - last_frame_time, 0.1)
+        last_frame_time = current_time
+
         for ball in balls[:]:
-            ball['pos'][0] += ball['vel'][0]
-            ball['pos'][1] += ball['vel'][1]
+            ball['pos'][0] += ball['vel'][0] * dt
+            ball['pos'][1] += ball['vel'][1] * dt
 
             bx, by = ball['pos']
             br = ball['radius']
@@ -355,7 +446,7 @@ def main_game_loop():
                     current_speed = math.sqrt(ball['vel'][0]**2 + ball['vel'][1]**2)
 
                     # Adjust X velocity based on where it hit
-                    new_vel_x = ball['vel'][0] + (hit_pos * 5)
+                    new_vel_x = ball['vel'][0] + (hit_pos * current_speed * 0.5)
 
                     # Normalize speed to keep it constant
                     angle = math.atan2(ball['vel'][1], new_vel_x)
@@ -373,7 +464,7 @@ def main_game_loop():
                         cv2.FONT_HERSHEY_TRIPLEX, 3, (0, 255, 0), 5)
             cv2.imshow('Face Breaker', frame)
             cv2.waitKey(3000)
-            restart_game()
+            restart_game(screen_width, screen_height)
 
         # --- DRAWING ---
 
@@ -423,7 +514,7 @@ def main_game_loop():
         if key == ord('q') or key == 27:
             break
         elif key == ord('r'):
-            restart_game()
+            restart_game(screen_width, screen_height)
 
     cap.release()
     cv2.destroyAllWindows()
