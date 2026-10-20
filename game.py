@@ -31,6 +31,22 @@ BLOCK_COLS = 10
 BLOCK_HEIGHT = 30
 POINTS_PER_BLOCK = 10
 
+# Special blocks
+TOUGH_BLOCK_CHANCE = 0.12   # takes two hits
+BOMB_BLOCK_CHANCE = 0.06    # takes its neighbours with it
+
+# Power-ups. Visitors often play for well under a minute, so most of these pay
+# out the moment they are caught; the timed ones are short, and the per-player
+# one expires with the player, leaving nothing behind when someone walks off.
+DROP_CHANCE = 0.2           # of a broken block leaving a capsule
+CAPSULE_SPEED = 0.25        # screen heights per second
+CAPSULE_SIZE = (54, 24)     # at 720p; scaled for other resolutions
+BONUS_POINTS = 50
+WIDE_PADDLE_FACTOR = 1.6
+WIDE_PADDLE_SECONDS = 6.0
+SLOW_BALL_FACTOR = 0.6
+SLOW_BALL_SECONDS = 5.0
+
 # Fraction of the frame held out of play on each side. The paddle follows the
 # face, and a face near the frame edge is both hard to reach and hard to
 # detect, so the walls sit where a player can comfortably get to them.
@@ -53,11 +69,13 @@ MIN_CONSECUTIVE_DETECTIONS = 2
 # --- GAME STATE ---
 balls = []
 blocks = []
+capsules = []
 players = {}
 pending_faces = {}
 next_player_id = 1
 next_pending_id = 1
 game_score = 0
+slow_ball_until = 0.0
 
 # --- HELPER FUNCTIONS ---
 
@@ -67,12 +85,14 @@ def restart_game(screen_width, screen_height):
     This used to re-exec the interpreter, which left the camera device open in
     the dying process and so failed to reopen it.
     """
-    global balls, players, pending_faces, game_score
+    global balls, capsules, players, pending_faces, game_score, slow_ball_until
     print("--- GAME RESTARTING ---")
     balls = []
+    capsules = []
     players = {}
     pending_faces = {}
     game_score = 0
+    slow_ball_until = 0.0
     create_blocks(screen_width, screen_height)
     spawn_ball(screen_width, screen_height)
 
@@ -98,11 +118,21 @@ def create_blocks(screen_width, screen_height):
             b_x = field_left + col * block_width
             b_y = row * BLOCK_HEIGHT + 60 # 60px buffer from top
 
+            roll = random.random()
+            if roll < BOMB_BLOCK_CHANCE:
+                kind, hits = 'bomb', 1
+            elif roll < BOMB_BLOCK_CHANCE + TOUGH_BLOCK_CHANCE:
+                kind, hits = 'tough', 2
+            else:
+                kind, hits = 'normal', 1
+
             # Add a small gap between blocks
             blocks.append({
                 'rect': [b_x + 2, b_y + 2, block_width - 4, BLOCK_HEIGHT - 4],
                 'color': color,
-                'active': True
+                'active': True,
+                'kind': kind,
+                'hits': hits
             })
 
 def spawn_ball(screen_width, screen_height):
@@ -124,14 +154,92 @@ def spawn_ball(screen_width, screen_height):
         }
         balls.append(new_ball)
 
+def split_balls():
+    """Multi-ball: every ball in play throws off a copy at an angle."""
+    global balls
+    for ball in balls[:]:
+        if len(balls) >= MAX_BALLS:
+            break
+        speed = math.hypot(ball['vel'][0], ball['vel'][1])
+        angle = math.atan2(ball['vel'][1], ball['vel'][0]) + random.choice((-1, 1)) * math.pi / 6
+        balls.append({
+            'pos': list(ball['pos']),
+            'vel': [speed * math.cos(angle), speed * math.sin(angle)],
+            'radius': ball['radius'],
+            'color': ball['color'],
+            'owner': ball.get('owner')
+        })
+
+
+# Capsule kinds, and how often each one drops relative to the others
+CAPSULE_KINDS = [
+    ('multi', 'M', (0, 255, 255), 35),
+    ('bonus', 'P', (0, 215, 255), 30),
+    ('wide',  'W', (0, 255, 0), 20),
+    ('slow',  'S', (255, 128, 0), 15),
+]
+
+
+def drop_capsule(x, y):
+    """Leaves a falling power-up behind a broken block."""
+    kinds = [k for k in CAPSULE_KINDS for _ in range(k[3])]
+    kind, letter, color, _ = random.choice(kinds)
+    capsules.append({'pos': [x, y], 'kind': kind, 'letter': letter, 'color': color})
+
+
+def collect_capsule(capsule, player, current_time, screen_height):
+    """Applies a caught power-up. Timed effects are short and expire on their own."""
+    global game_score, slow_ball_until
+    kind = capsule['kind']
+    if kind == 'multi':
+        split_balls()
+    elif kind == 'bonus':
+        game_score += BONUS_POINTS
+        player['score'] = player.get('score', 0) + BONUS_POINTS
+    elif kind == 'wide':
+        # Lives on the player, so it disappears when the player does
+        player['wide_until'] = current_time + WIDE_PADDLE_SECONDS
+    elif kind == 'slow':
+        slow_ball_until = current_time + SLOW_BALL_SECONDS
+
+
+def break_block(block, owner, screen_height):
+    """Scores and removes a block, handling the special kinds.
+
+    A tough block survives its first hit. A bomb takes its neighbours with it,
+    so a single lucky shot clears a visible hole.
+    """
+    global game_score
+    block['hits'] -= 1
+    if block['hits'] > 0:
+        return
+
+    block['active'] = False
+    game_score += POINTS_PER_BLOCK
+    if owner:
+        owner['score'] = owner.get('score', 0) + POINTS_PER_BLOCK
+
+    bx, by, bw, bh = block['rect']
+    if block['kind'] == 'bomb':
+        for other in blocks:
+            if not other['active']:
+                continue
+            ox, oy, ow, oh = other['rect']
+            if abs((ox + ow / 2) - (bx + bw / 2)) < bw * 1.6 and abs((oy + oh / 2) - (by + bh / 2)) < bh * 1.6:
+                break_block(other, owner, screen_height)
+    elif random.random() < DROP_CHANCE:
+        drop_capsule(bx + bw / 2, by + bh / 2)
+
+
 def scale_to_frame(screen_height):
     """Scales the pixel sizes, which are tuned for 720p, to the camera's frame.
 
     Whatever resolution the camera gives us, the game should look the same.
     """
     global BALL_RADIUS, PADDLE_WIDTH, PADDLE_HEIGHT, PADDLE_Y_OFFSET
-    global BLOCK_HEIGHT, MAX_DISTANCE_SQUARED
+    global BLOCK_HEIGHT, MAX_DISTANCE_SQUARED, CAPSULE_SIZE
     factor = screen_height / 720
+    CAPSULE_SIZE = (round(CAPSULE_SIZE[0] * factor), round(CAPSULE_SIZE[1] * factor))
     BALL_RADIUS = max(4, round(BALL_RADIUS * factor))
     PADDLE_WIDTH = round(PADDLE_WIDTH * factor)
     PADDLE_HEIGHT = max(4, round(PADDLE_HEIGHT * factor))
@@ -349,7 +457,7 @@ def main_game_loop():
 
         # Detect on a downscaled copy (4x cheaper), then map the rects back up
         small = cv2.resize(gray, None, fx=DETECT_SCALE, fy=DETECT_SCALE, interpolation=cv2.INTER_AREA)
-        min_size = max(20, int(screen_height * 0.05 * DETECT_SCALE))
+        min_size = max(20, int(screen_height * 0.08 * DETECT_SCALE))
         new_faces = [(int(x / DETECT_SCALE), int(y / DETECT_SCALE),
                       int(w / DETECT_SCALE), int(h / DETECT_SCALE))
                      for x, y, w, h in face_cascade.detectMultiScale(
@@ -374,9 +482,11 @@ def main_game_loop():
         # 1. Place every paddle under its player's face, once per frame
         for player in players.values():
             fx, fy, fw, fh = player['face_rect']
-            paddle_x = fx + fw // 2 - PADDLE_WIDTH // 2
-            paddle_x = max(field_left, min(field_right - PADDLE_WIDTH, paddle_x))
-            player['paddle_rect'] = (paddle_x, paddle_y, PADDLE_WIDTH, PADDLE_HEIGHT)
+            wide = current_time < player.get('wide_until', 0)
+            width = round(PADDLE_WIDTH * WIDE_PADDLE_FACTOR) if wide else PADDLE_WIDTH
+            paddle_x = fx + fw // 2 - width // 2
+            paddle_x = max(field_left, min(field_right - width, paddle_x))
+            player['paddle_rect'] = (paddle_x, paddle_y, width, PADDLE_HEIGHT)
 
         # 2. Update Ball Positions
         # Velocities are per second, so the ball moves at the same speed no
@@ -386,9 +496,11 @@ def main_game_loop():
         dt = min(current_time - last_frame_time, 0.1)
         last_frame_time = current_time
 
+        ball_dt = dt * (SLOW_BALL_FACTOR if current_time < slow_ball_until else 1.0)
+
         for ball in balls[:]:
-            ball['pos'][0] += ball['vel'][0] * dt
-            ball['pos'][1] += ball['vel'][1] * dt
+            ball['pos'][0] += ball['vel'][0] * ball_dt
+            ball['pos'][1] += ball['vel'][1] * ball_dt
 
             bx, by = ball['pos']
             br = ball['radius']
@@ -422,12 +534,8 @@ def main_game_loop():
                 col_type = check_aabb_collision(ball['pos'][0], ball['pos'][1], br, bx, by, bw, bh)
 
                 if col_type:
-                    block['active'] = False
-                    game_score += POINTS_PER_BLOCK
                     # Credit whoever last hit this ball
-                    owner = players.get(ball.get('owner'))
-                    if owner:
-                        owner['score'] = owner.get('score', 0) + POINTS_PER_BLOCK
+                    break_block(block, players.get(ball.get('owner')), screen_height)
                     hit_block = True
 
                     if col_type == 'y':
@@ -440,16 +548,16 @@ def main_game_loop():
 
             # Paddle Collisions (Players)
             for pid, player in players.items():
-                paddle_x, paddle_y, _, _ = player['paddle_rect']
+                paddle_x, paddle_y, paddle_width, _ = player['paddle_rect']
 
                 # Collision Check
                 col_type = check_aabb_collision(ball['pos'][0], ball['pos'][1], br,
-                                                paddle_x, paddle_y, PADDLE_WIDTH, PADDLE_HEIGHT)
+                                                paddle_x, paddle_y, paddle_width, PADDLE_HEIGHT)
 
                 if col_type:
                     # Determine hit position relative to paddle center (-1 to 1)
-                    paddle_center = paddle_x + PADDLE_WIDTH / 2
-                    hit_pos = (ball['pos'][0] - paddle_center) / (PADDLE_WIDTH / 2)
+                    paddle_center = paddle_x + paddle_width / 2
+                    hit_pos = (ball['pos'][0] - paddle_center) / (paddle_width / 2)
                     ball['owner'] = pid
 
                     # Reflect Y (always bounce up)
@@ -475,6 +583,24 @@ def main_game_loop():
                     ball['pos'][1] = paddle_y - br - 1
                     break
 
+        # 3. Falling Power-ups
+        cap_w, cap_h = CAPSULE_SIZE
+        for capsule in capsules[:]:
+            capsule['pos'][1] += CAPSULE_SPEED * screen_height * dt
+            cx, cy = capsule['pos']
+
+            if cy - cap_h / 2 > screen_height:
+                capsules.remove(capsule)
+                continue
+
+            for player in players.values():
+                px, py, pw, ph = player['paddle_rect']
+                if (abs(cx - (px + pw / 2)) < (pw + cap_w) / 2
+                        and abs(cy - (py + ph / 2)) < (ph + cap_h) / 2):
+                    collect_capsule(capsule, player, current_time, screen_height)
+                    capsules.remove(capsule)
+                    break
+
         # Check Win Condition
         active_blocks = [b for b in blocks if b['active']]
         if not active_blocks:
@@ -496,8 +622,31 @@ def main_game_loop():
         for block in blocks:
             if block['active']:
                 bx, by, bw, bh = block['rect']
-                cv2.rectangle(frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), block['color'], -1)
-                cv2.rectangle(frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), (0,0,0), 1)
+                p1, p2 = (int(bx), int(by)), (int(bx+bw), int(by+bh))
+                cv2.rectangle(frame, p1, p2, block['color'], -1)
+                cv2.rectangle(frame, p1, p2, (0,0,0), 1)
+
+                if block['kind'] == 'bomb':
+                    # Ringed, so it reads as different from across the room
+                    cv2.circle(frame, ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2),
+                               int(bh/2) - 2, (255, 255, 255), 2)
+                elif block['kind'] == 'tough':
+                    if block['hits'] > 1:
+                        cv2.rectangle(frame, p1, p2, (255, 255, 255), 2)
+                    else:
+                        # Cracked after surviving a hit
+                        cv2.line(frame, p1, p2, (0, 0, 0), 2)
+                        cv2.line(frame, (p1[0], p2[1]), (p2[0], p1[1]), (0, 0, 0), 2)
+
+        # Draw Falling Power-ups
+        for capsule in capsules:
+            cx, cy = int(capsule['pos'][0]), int(capsule['pos'][1])
+            cv2.rectangle(frame, (cx - cap_w//2, cy - cap_h//2), (cx + cap_w//2, cy + cap_h//2),
+                          capsule['color'], -1)
+            cv2.rectangle(frame, (cx - cap_w//2, cy - cap_h//2), (cx + cap_w//2, cy + cap_h//2),
+                          (255, 255, 255), 2)
+            cv2.putText(frame, capsule['letter'], (cx - cap_w//6, cy + cap_h//3),
+                        cv2.FONT_HERSHEY_DUPLEX, cap_h / 30, (0, 0, 0), 2)
 
         # Draw Paddles and Connectors
         for pid, player in players.items():
