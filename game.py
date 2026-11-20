@@ -229,9 +229,11 @@ def detect_loop():
         small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if DETECT_SCALE != 1.0 else frame
         face_detector.setInputSize((small.shape[1], small.shape[0]))
         _, dets = face_detector.detect(small)
-        # (center_x, eye_mid_y) per face. The eye midpoint is hair-independent, unlike the box
-        # top edge, which moves with a fringe. dets is None (not an empty array) when nothing is found
-        faces = [((d[0] + d[2] / 2) / DETECT_SCALE, (d[5] + d[7]) / 2 / DETECT_SCALE)
+        # (center_x, eye_mid_y, chin_y) per face. The eye midpoint is hair-independent, unlike
+        # the box top edge, which moves with a fringe; chin_y is where the marker hangs.
+        # dets is None (not an empty array) when nothing is found
+        faces = [((d[0] + d[2] / 2) / DETECT_SCALE, (d[5] + d[7]) / 2 / DETECT_SCALE,
+                  (d[1] + d[3]) / DETECT_SCALE)
                  for d in (dets if dets is not None else ())]
         with cam_lock:
             latest_faces = faces
@@ -260,14 +262,26 @@ paddleX = width - 230
 ball = Vec(100, 100, 10, 10)
 reset_ball(ball)
 
-leftScore = 0
-rightScore = 0
 
 
-def reset_scores(reason):
-    global leftScore, rightScore
-    leftScore = rightScore = 0
-    print(f"Score reset: {reason}")
+COUNTDOWN_SEC = 0.5         # Per number, so 3-2-1 runs 1.5 s
+countdown_until = 0.0       # Ball is held at centre until this time
+
+
+def reset_game(reason, countdown=False):
+    """Zero every score and recentre the ball. Only the deliberate resets get a 3-2-1."""
+    global countdown_until
+    for t in tracks.values():
+        t['score'] = 0
+    bot_scores[0] = bot_scores[1] = 0
+    reset_ball(ball)
+    if countdown:
+        countdown_until = time.time() + 3 * COUNTDOWN_SEC
+    print(f"Game reset: {reason}")
+
+# --- Marker colours ---
+PLAYER_COLOR = (0, 165, 255)    # Orange, matching a human's paddle
+BYSTANDER_COLOR = (150, 150, 150)   # Grey: tracked and numbered, but not holding a slot
 
 # --- Game & Paddle Constants ---
 PADDLE_WIDTH = 30
@@ -283,8 +297,7 @@ MIN_ANGLE_TAN = math.tan(math.radians(MIN_ANGLE_DEG))
 MAX_ANGLE_TAN = math.tan(math.radians(MAX_ANGLE_DEG))
 
 
-# --- AFK Bot Constants ---
-AFK_TIMEOUT = 10.0
+# --- Bot Constants (a bot plays any side whose slot is empty; see TRACK_TTL) ---
 BOT_SPEED = 12 * K
 BOT_DEV_RANGE = 75
 BOT_OVERSHOOT_FACTOR = 1.1
@@ -308,14 +321,25 @@ smooth_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
 smooth_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2
 tick_counter = 0
 
-# --- AFK Time Tracking ---
 current_time = time.time()
-last_face_time_left = current_time
-last_face_time_right = current_time
-is_afk_left = False
+
+# --- People tracking -------------------------------------------------------
+# The detector has no notion of identity: every frame it just reports boxes. Faces are matched
+# to the previous frame's by position, which is enough here because people walk, they do not
+# teleport. A track outlives TRACK_TTL seconds of missed detections, so looking away or being
+# briefly hidden behind someone costs nothing; walking off costs the slot and the score.
+TRACK_TTL = 3.0             # Seconds a track (and its slot) survives with no detection
+TRACK_MATCH_DIST = 180      # Max px a face may move between detections and still be one person
+TRACK_MATCH_DRIFT = 400     # Extra px of search per second unseen: people keep walking while
+                            # the detector has lost them, so the window has to open up with time
+
+tracks = {}                 # track id -> player state; see new_track()
+next_track_id = 0
+next_player_number = 1      # Reset to 1 whenever the field empties, so numbers get reused
+slots = [None, None]        # Track id playing each side, None when nobody holds it
+bot_scores = [0, 0]         # What the bot has earned on a side since the slot came free
+is_afk_left = False         # "AFK" now just means this side's slot is empty
 is_afk_right = False
-# Who is playing each side, as (left_is_bot, right_is_bot). Any change starts a new game.
-lineup = (is_afk_left, is_afk_right)
 
 # --- Auto-Update Tracking ---
 UPDATE_CHECK_INTERVAL = 60 # 1 minute (in seconds)
@@ -326,6 +350,81 @@ was_idle_last_frame = False # Check for transition to idle
 
 # --- Center line for assignment ---
 center_x = width / 2
+
+
+def side_of(x):
+    """Which half of the frame a face is standing in."""
+    return 0 if x < center_x else 1
+
+
+def update_tracks(faces, now):
+    """Match this frame's faces to the people already being followed."""
+    global next_track_id, next_player_number
+
+    free = dict(tracks)                     # Tracks not yet claimed by a face this frame
+    for (cx, eye_y, chin_y) in faces:
+        best, best_score = None, 1.0
+        for tid, t in free.items():
+            limit = TRACK_MATCH_DIST + TRACK_MATCH_DRIFT * (now - t['last_seen'])
+            # Scored as a fraction of each track's own window, so a long-unseen track competes
+            # fairly with one seen last frame instead of always losing on raw distance
+            score = math.hypot(cx - t['x'], eye_y - t['eye_y']) / limit
+            if score < best_score:
+                best, best_score = tid, score
+        if best is None:                    # Nobody nearby was here before, so this is a newcomer
+            best = next_track_id
+            next_track_id += 1
+            tracks[best] = {'number': next_player_number, 'score': 0}
+            next_player_number += 1
+        else:
+            del free[best]
+        tracks[best].update(x=cx, eye_y=eye_y, chin_y=chin_y, last_seen=now, visible=True)
+
+    for tid, t in free.items():             # Seen before, not in this frame
+        t['visible'] = False
+    for tid in [tid for tid, t in tracks.items() if now - t['last_seen'] > TRACK_TTL]:
+        del tracks[tid]                     # Gone long enough to count as gone
+
+
+def update_slots():
+    """Hand out and take back the one playing slot each side has."""
+    global is_afk_left, is_afk_right
+
+    for side in (0, 1):
+        tid = slots[side]
+        # A slot is only ever given up by its own holder: by leaving, or by crossing over.
+        # Other people crowding onto the side cannot take it off them.
+        if tid is not None and (tid not in tracks or side_of(tracks[tid]['x']) != side):
+            slots[side] = None
+            bot_scores[side] = 0            # The bot plays for itself, from zero
+
+    for side in (0, 1):
+        if slots[side] is None:
+            here = [tid for tid, t in tracks.items() if side_of(t['x']) == side]
+            if len(here) == 1:              # Exactly one person on that side, so no ambiguity
+                slots[side] = here[0]
+
+    is_afk_left = slots[0] is None
+    is_afk_right = slots[1] is None
+
+
+def side_label(side):
+    """What to call whoever is playing a side, matching the marker under their face."""
+    tid = slots[side]
+    return "Bot" if tid is None else f"Player {tracks[tid]['number']}"
+
+
+def side_score(side):
+    tid = slots[side]
+    return bot_scores[side] if tid is None else tracks[tid]['score']
+
+
+def add_point(side):
+    tid = slots[side]
+    if tid is None:
+        bot_scores[side] += 1
+    else:
+        tracks[tid]['score'] += 1           # Points belong to the person, and travel with them
 
 
 def bounce(paddle_speed):
@@ -340,68 +439,55 @@ def bounce(paddle_speed):
 
 def tick(faces, new_faces):
     """Advance the game by exactly one fixed timestep"""
-    global leftScore, rightScore, leftPaddleY, rightPaddleY, leftFaceY, rightFaceY
-    global prevLeftPaddleY, prevRightPaddleY, last_face_time_left, last_face_time_right
+    global leftPaddleY, rightPaddleY, leftFaceY, rightFaceY
+    global prevLeftPaddleY, prevRightPaddleY, next_player_number
     global raw_left_bot_target_y, raw_right_bot_target_y
     global smooth_left_bot_target_y, smooth_right_bot_target_y
-    global tick_counter, is_afk_left, is_afk_right, lineup
+    global tick_counter, is_afk_left, is_afk_right
     tick_counter += 1
 
-    # --- 1. Ball Movement ---
-    ball.x += ball.dx
-    ball.y += ball.dy
+    # --- 1. Ball Movement (held still through the countdown; paddles keep tracking) ---
+    counting_down = current_time < countdown_until
+    if not counting_down:
+        ball.x += ball.dx
+        ball.y += ball.dy
 
-    # --- 2. Wall & Goal Collisions ---
-    if ball.y > COURT_BOTTOM - BALL_RADIUS:
-        ball.y = COURT_BOTTOM - BALL_RADIUS
-        ball.dy *= -1
-    if ball.y < COURT_TOP + BALL_RADIUS:
-        ball.y = COURT_TOP + BALL_RADIUS
-        ball.dy *= -1
-    if ball.x > width - BALL_RADIUS:
-        reset_ball(ball)
-        leftScore = leftScore + 1
-    if ball.x < BALL_RADIUS:
-        reset_ball(ball)
-        rightScore = rightScore + 1
+        # --- 2. Wall & Goal Collisions ---
+        if ball.y > COURT_BOTTOM - BALL_RADIUS:
+            ball.y = COURT_BOTTOM - BALL_RADIUS
+            ball.dy *= -1
+        if ball.y < COURT_TOP + BALL_RADIUS:
+            ball.y = COURT_TOP + BALL_RADIUS
+            ball.dy *= -1
+        if ball.x > width - BALL_RADIUS:
+            reset_ball(ball)
+            add_point(0)
+        if ball.x < BALL_RADIUS:
+            reset_ball(ball)
+            add_point(1)
 
-    # --- 3. Location-based Paddle Assignment (Human Input) ---
-    # Only a fresh camera frame counts as "face seen"; ticks run faster than the camera
+    # --- 3. Follow the people in frame (only a fresh camera frame carries new positions) ---
     if new_faces:
-        best_left_y = None
-        best_right_y = None
+        was_occupied = bool(tracks)
+        update_tracks(faces, current_time)
+        update_slots()
+        if was_occupied and not tracks:
+            # Field empty. Numbers start over at 1 and nothing is carried into the next game.
+            next_player_number = 1
+            bot_scores[0] = bot_scores[1] = 0
+            reset_game("field empty")
 
-        for (face_center_x, anchor_y) in faces:
-            y = anchor_y - PADDLE_HEIGHT / 2   # Centre the paddle on the eyes, not hang it below
-            if face_center_x < center_x:
-                if best_left_y is None or y < best_left_y:
-                    best_left_y = y
-            else:
-                if best_right_y is None or y < best_right_y:
-                    best_right_y = y
-
-        # A face in the out-of-play strips still counts; it clamps to the court limit, so the
-        # extremes are reachable without putting your head at the very edge of the frame
-        if best_left_y is not None:
-            leftFaceY = min(max(best_left_y, COURT_TOP), COURT_BOTTOM - PADDLE_HEIGHT)
-            last_face_time_left = current_time
-
-        if best_right_y is not None:
-            rightFaceY = min(max(best_right_y, COURT_TOP), COURT_BOTTOM - PADDLE_HEIGHT)
-            last_face_time_right = current_time
-
-    is_afk_left = current_time - last_face_time_left > AFK_TIMEOUT
-    is_afk_right = current_time - last_face_time_right > AFK_TIMEOUT
-
-    # Whoever was playing is no longer who is playing: somebody arrived or left on one side,
-    # or both. Carrying the old score into a new pairing is meaningless, so start over.
-    # Note this can only see a side go empty for AFK_TIMEOUT and come back; one person
-    # stepping straight into another's place is indistinguishable from the same person moving.
-    if (is_afk_left, is_afk_right) != lineup:
-        was, lineup = lineup, (is_afk_left, is_afk_right)
-        reset_scores("%s -> %s" % (
-            "/".join("bot" if b else "human" for b in was),
-            "/".join("bot" if b else "human" for b in lineup)))
+    # Paddle target is the slot holder's eyes. A face out in the dimmed strips still counts;
+    # it clamps to the court limit, so the extremes are reachable without going to the frame edge
+    for side, tid in enumerate(slots):
+        if tid is None:
+            continue
+        y = tracks[tid]['eye_y'] - PADDLE_HEIGHT / 2   # Centre the paddle on the eyes
+        y = min(max(y, COURT_TOP), COURT_BOTTOM - PADDLE_HEIGHT)
+        if side == 0:
+            leftFaceY = y
+        else:
+            rightFaceY = y
 
     # Humans glide toward their face position so 30 fps camera input looks smooth at 60 ticks
     if not is_afk_left:
@@ -472,17 +558,43 @@ def render(img):
     for index, paddle_y, is_afk in ((0, leftPaddleY, is_afk_left), (1, rightPaddleY, is_afk_right)):
         paddle_x = 100 + (index * paddleX)
         # Orange for Human, Blue for Bot
-        color = (0, 165, 255) if not is_afk else (255, 0, 0)
+        color = PLAYER_COLOR if not is_afk else (255, 0, 0)
         cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
 
     cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
 
-    left_status = "Bot" if is_afk_left else "Human"
-    right_status = "Bot" if is_afk_right else "Human"
-    # Inside the court: the strips are dimmed, and this text is black
-    score_y = COURT_TOP + 40
-    cv2.putText(img, f'L ({left_status}): {leftScore}', (50, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-    cv2.putText(img, f'R ({right_status}): {rightScore}', (700, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    # Everyone in frame gets a marker and their number. Whoever holds a slot is in the player
+    # colour, bystanders are grey, so it reads at a glance who the paddles belong to.
+    playing = [tid for tid in slots if tid is not None]
+    for tid, t in tracks.items():
+        if not t['visible']:
+            continue                        # Mid-dropout: the slot is held, but do not draw a
+                                            # marker on a face that is not currently there
+        color = PLAYER_COLOR if tid in playing else BYSTANDER_COLOR
+        name = f"Player {t['number']}"
+        mx, my = int(t['x']), int(t['chin_y']) + 10
+        cv2.fillPoly(img, [np.array([(mx, my), (mx - 12, my + 16), (mx + 12, my + 16)])], color)
+        (tw, th), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        org = (mx - tw // 2, min(my + 30 + th, height - 8))
+        cv2.putText(img, name, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.putText(img, name, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+    # Scores. Sides are obvious from the layout, so the only label is who is playing:
+    # the same name as under their face, or Bot when the slot is empty
+    score_y = COURT_TOP + 40        # Inside the court; the strips are dimmed and this text is black
+    right_text = f'{side_label(1)}: {side_score(1)}'
+    (rw, _), _ = cv2.getTextSize(right_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
+    cv2.putText(img, f'{side_label(0)}: {side_score(0)}', (50, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(img, right_text, (width - 50 - rw, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+
+    # 3-2-1 over the middle of the court while the ball is held
+    remaining = countdown_until - time.time()
+    if remaining > 0:
+        n = str(math.ceil(remaining / COUNTDOWN_SEC))
+        (tw, th), _ = cv2.getTextSize(n, cv2.FONT_HERSHEY_SIMPLEX, 6, 12)
+        org = ((width - tw) // 2, (COURT_TOP + COURT_BOTTOM + th) // 2)
+        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, 6, (0, 0, 0), 20, cv2.LINE_AA)
+        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, 6, (255, 255, 255), 12, cv2.LINE_AA)
 
     # Orange frame on the outermost pixels: marks where the camera image ends and the screen's
     # own letterboxing begins (highgui defaults to WINDOW_KEEPRATIO, so a 16:9 image on a 3:2
@@ -491,6 +603,8 @@ def render(img):
 
     cv2.imshow(window_name, img)
 
+
+reset_game("startup", countdown=True)
 
 seen_face_seq = 0
 accumulator = 0.0
@@ -556,7 +670,7 @@ while camera_ok:
     if k == 27: # ESC key
         break
     if k in (ord('r'), ord('R')):   # Manual score reset
-        reset_scores("'r' pressed")
+        reset_game("'r' pressed", countdown=True)
 
     # --- Frame cap: sleep only the time left until the next frame deadline ---
     next_frame += FRAME_TIME
