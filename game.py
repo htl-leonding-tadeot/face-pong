@@ -7,6 +7,8 @@ import subprocess  # For running shell commands
 import os          # For restarting the script
 import sys         # For restarting the script
 import threading   # Camera + face detection run off the render thread
+import glob        # Enumerating /dev/video* for camera autodetect
+import re
 
 width = 1280
 height = 720
@@ -14,17 +16,66 @@ height = 720
 # Make sure 'haarcascade_frontalface_default.xml' is in the same directory
 face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
-# Camera index (OpenCV order, differs from ffmpeg listing; Nikon = 0 when connected)
-cap = cv2.VideoCapture(int(os.environ.get("CAMERA", 0)))
-# Ask for the best camera mode (Nikon Z50II: 1080p60 MJPEG); frames get resized to width x height
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-cap.set(cv2.CAP_PROP_FPS, 60)
+IS_LINUX = sys.platform.startswith("linux")
+
+if IS_LINUX and "GDK_BACKEND" not in os.environ and os.environ.get("DISPLAY"):
+    # OpenCV's GTK window has no frame sync on GDK's Wayland backend: waitKey() blocks ~21 ms, which
+    # caps the loop at ~34 fps and makes the fullscreen surface flicker. Via XWayland it's ~3.5 ms.
+    # Must be set before the first cv2 window call (that's where GTK initialises). macOS uses Cocoa.
+    os.environ["GDK_BACKEND"] = "x11"
+
+if IS_LINUX:
+    # Letting Haar fan out over all 16 cores costs ~40% more CPU for no extra fps, and the
+    # OpenMP pool's spin-wait is what made the laptop hot. macOS keeps OpenCV's own default.
+    cv2.setNumThreads(int(os.environ.get("CV_THREADS", 4)))
+
+
+def open_camera(index):
+    """Open one camera index at the best mode (Nikon Z50II: 1080p60 MJPEG); frames get resized to width x height."""
+    # Linux needs the V4L2 backend: the GStreamer one OpenCV prefers fails to negotiate with UVC
+    # ("Internal data stream error"). macOS keeps CAP_ANY -> AVFoundation, which worked as-is.
+    c = cv2.VideoCapture(index, cv2.CAP_V4L2 if IS_LINUX else cv2.CAP_ANY)
+    if IS_LINUX:
+        # V4L2 opens in YUYV, which has no 1080p60 mode on either camera here; MJPEG does
+        c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    c.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    c.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    c.set(cv2.CAP_PROP_FPS, 60)
+    if not c.isOpened():
+        c.release()
+        return None
+    if IS_LINUX and not c.read()[0]:
+        c.release()                 # Opens fine but yields nothing: a UVC metadata node, not a camera
+        return None
+    return c
+
+
+def camera_candidates():
+    """Camera indices to try, preferred first; device order differs per machine."""
+    if "CAMERA" in os.environ:
+        return [int(os.environ["CAMERA"])]
+    if not IS_LINUX:
+        return [0]                  # macOS: unchanged, AVFoundation lists the Nikon first when connected
+    # Linux enumerates differently (Nikon = /dev/video2 here, and video1/3 are metadata nodes),
+    # so pick by device name instead of a hardcoded index.
+    want = os.environ.get("CAMERA_NAME", "NIKON").lower()
+
+    def name(i):
+        try:
+            with open(f"/sys/class/video4linux/video{i}/name") as f:
+                return f.read().strip().lower()
+        except OSError:
+            return ""
+
+    idx = sorted(int(re.search(r"\d+$", p).group()) for p in glob.glob("/dev/video*"))
+    return sorted(idx, key=lambda i: want not in name(i))  # name match first, else ascending
+
+
+cap = next((c for c in map(open_camera, camera_candidates()) if c), None)
+if cap is None:
+    sys.exit("No usable camera found. Set CAMERA=<index> to pick one.")
 
 window_name = "image"
-
-cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
 # --- Helper function to check for git updates ---
@@ -112,32 +163,77 @@ def reset_ball(ball, speed=15 * K):
     ball.dy = speed * math.sin(angle_rad)
 
 
-# --- Camera thread: grabs frames and runs face detection at camera rate ---
+# --- Camera + detection threads, both off the render thread ---
+# Haar is by far the most expensive step (~34 ms on a 720p frame, and it uses every core), so it
+# runs on its own thread at its own rate instead of once per camera frame. Capture and render stay
+# at 60 fps; faces just refresh a little less often, which HUMAN_SMOOTHING already smooths over.
+DETECT_SCALE = 0.5          # Detect on a half-size frame (~4x cheaper); rects scale back up. 1.0 = old behaviour
+DETECT_MAX_HZ = 30          # Upper bound on detections per second
+
 latest_img = np.zeros((height, width, 3), np.uint8)
 latest_faces = ()
-face_seq = 0                # Increments per processed camera frame
+frame_seq = 0               # Increments per camera frame
+face_seq = 0                # Increments per completed detection
 camera_ok = True
 stop_event = threading.Event()
 cam_lock = threading.Lock()
+frame_ready = threading.Condition(cam_lock)
 
 
 def camera_loop():
-    global latest_img, latest_faces, face_seq, camera_ok
+    global latest_img, frame_seq, camera_ok
     while not stop_event.is_set():
         ret, frame = cap.read()  # Blocks until next camera frame (releases GIL)
         if not ret:
             camera_ok = False
+            with frame_ready:
+                frame_ready.notify_all()    # Don't leave the detector blocked on a dead camera
             return
         # Camera may ignore the requested resolution; game logic assumes width x height
         frame = cv2.resize(cv2.flip(frame, 1), (width, height))
-        faces = face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.25, 4)
+        with frame_ready:
+            latest_img = frame              # Fresh array each frame, so readers can hold it unlocked
+            frame_seq += 1
+            frame_ready.notify_all()
+
+
+def detect_loop():
+    global latest_faces, face_seq
+    seen = 0
+    while not stop_event.is_set():
+        started = time.perf_counter()
+        with frame_ready:
+            # Wait for a frame newer than the last one detected on; older ones are dropped
+            frame_ready.wait_for(lambda: frame_seq != seen or stop_event.is_set() or not camera_ok, 0.5)
+            if not camera_ok:
+                return
+            frame, seen = latest_img, frame_seq
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if DETECT_SCALE != 1.0:
+            gray = cv2.resize(gray, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
+        faces = face_cascade.detectMultiScale(gray, 1.25, 4)
+        if DETECT_SCALE != 1.0 and len(faces):
+            faces = (np.asarray(faces) / DETECT_SCALE).astype(int)  # Back into width x height coords
         with cam_lock:
-            latest_img, latest_faces = frame, faces
+            latest_faces = faces
             face_seq += 1
+        # Detection is the one CPU hog; leave the cores alone if it finished early
+        slack = 1.0 / DETECT_MAX_HZ - (time.perf_counter() - started)
+        if slack > 0:
+            time.sleep(slack)
 
 
 cam_thread = threading.Thread(target=camera_loop, daemon=True)
 cam_thread.start()
+detect_thread = threading.Thread(target=detect_loop, daemon=True)
+detect_thread.start()
+
+# Wait for the first real frame before opening the window, so it never shows uninitialised content
+with frame_ready:
+    frame_ready.wait_for(lambda: frame_seq > 0 or not camera_ok, 5.0)
+
+cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
+cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
 paddleX = width - 230
@@ -349,6 +445,10 @@ accumulator = 0.0
 last_time = time.perf_counter()
 next_frame = last_time
 
+# FPS_DEBUG=1 prints render/camera/detect rates once a second
+fps_debug = os.environ.get("FPS_DEBUG") == "1"
+fps_mark, fps_frames, fps_cam, fps_det = last_time, 0, frame_seq, face_seq
+
 while camera_ok:
     now = time.perf_counter()
     # ponytail: clamp catch-up so a stall (window drag, git fetch) doesn't spiral; game just slows briefly
@@ -367,6 +467,15 @@ while camera_ok:
 
     # --- Render (copy: camera frame is shared and may be redrawn next frame) ---
     render(img.copy())
+
+    if fps_debug:
+        fps_frames += 1
+        elapsed = now - fps_mark
+        if elapsed >= 1.0:
+            print("render %.1f fps | camera %.1f fps | detect %.1f fps"
+                  % (fps_frames / elapsed, (frame_seq - fps_cam) / elapsed,
+                     (face_seq - fps_det) / elapsed), flush=True)
+            fps_mark, fps_frames, fps_cam, fps_det = now, 0, frame_seq, face_seq
 
     # --- Auto-Update Logic ---
     if current_time - last_update_check_time > UPDATE_CHECK_INTERVAL:
@@ -405,5 +514,6 @@ while camera_ok:
 
 stop_event.set()
 cam_thread.join(timeout=1)
+detect_thread.join(timeout=1)
 cap.release()
 cv2.destroyAllWindows()
