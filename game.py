@@ -15,14 +15,17 @@ height = 720
 
 # Fraction of the frame held out of play at the top and bottom. The paddle follows the face
 # one-to-one, and a face at the very frame edge is both awkward to reach and the first thing
-# the cascade loses, so the court stops short of it. Faces in the strips are still tracked and
+# the detector loses, so the court stops short of it. Faces in the strips are still tracked and
 # just pin the paddle at the court limit, which is how you reach the extremes.
 COURT_PADDING = 0.10
 COURT_TOP = round(height * COURT_PADDING)
 COURT_BOTTOM = height - COURT_TOP
 
-# Make sure 'haarcascade_frontalface_default.xml' is in the same directory
-face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
+# YuNet (OpenCV 4.5.4+). Input size is set per-frame in detect_loop(). Paths here are
+# relative to the cwd, like the git calls in check_for_update(): both assume the repo root.
+face_detector = cv2.FaceDetectorYN.create(
+    './face_detection_yunet_2023mar.onnx', '', (320, 320),
+    score_threshold=0.7, nms_threshold=0.3, top_k=50)
 
 IS_LINUX = sys.platform.startswith("linux")
 
@@ -33,7 +36,7 @@ if IS_LINUX and "GDK_BACKEND" not in os.environ and os.environ.get("DISPLAY"):
     os.environ["GDK_BACKEND"] = "x11"
 
 if IS_LINUX:
-    # Letting Haar fan out over all 16 cores costs ~40% more CPU for no extra fps, and the
+    # Letting detection fan out over all 16 cores costs ~40% more CPU for no extra fps, and the
     # OpenMP pool's spin-wait is what made the laptop hot. macOS keeps OpenCV's own default.
     cv2.setNumThreads(int(os.environ.get("CV_THREADS", 4)))
 
@@ -172,11 +175,10 @@ def reset_ball(ball, speed=15 * K):
 
 
 # --- Camera + detection threads, both off the render thread ---
-# Haar is by far the most expensive step (~34 ms on a 720p frame, and it uses every core), so it
-# runs on its own thread at its own rate instead of once per camera frame. Capture and render stay
-# at 60 fps; faces just refresh a little less often, which HUMAN_SMOOTHING already smooths over.
-DETECT_SCALE = 0.5          # Detect on a half-size frame (~4x cheaper); rects scale back up. 1.0 = old behaviour
-DETECT_MAX_HZ = 30          # Upper bound on detections per second
+# Detection is still the most expensive step, so it runs on its own thread at its own rate
+# instead of once per camera frame. Capture and render stay at 60 fps regardless.
+DETECT_SCALE = 0.5          # Detect on a half-size frame (~3x cheaper); coords scale back up. 1.0 = full frame
+DETECT_MAX_HZ = 60          # Upper bound on detections per second (YuNet is ~4.7 ms a frame)
 
 latest_img = np.zeros((height, width, 3), np.uint8)
 latest_faces = ()
@@ -222,12 +224,15 @@ def detect_loop():
             if not camera_ok:
                 return
             frame, seen = latest_img, frame_seq
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if DETECT_SCALE != 1.0:
-            gray = cv2.resize(gray, None, fx=DETECT_SCALE, fy=DETECT_SCALE)
-        faces = face_cascade.detectMultiScale(gray, 1.25, 4)
-        if DETECT_SCALE != 1.0 and len(faces):
-            faces = (np.asarray(faces) / DETECT_SCALE).astype(int)  # Back into width x height coords
+        # YuNet takes BGR, and returns Nx15: box x,y,w,h, then five (x,y) landmarks in the
+        # order right eye, left eye, nose tip, right mouth corner, left mouth corner, then score
+        small = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE) if DETECT_SCALE != 1.0 else frame
+        face_detector.setInputSize((small.shape[1], small.shape[0]))
+        _, dets = face_detector.detect(small)
+        # (center_x, eye_mid_y) per face. The eye midpoint is hair-independent, unlike the box
+        # top edge, which moves with a fringe. dets is None (not an empty array) when nothing is found
+        faces = [((d[0] + d[2] / 2) / DETECT_SCALE, (d[5] + d[7]) / 2 / DETECT_SCALE)
+                 for d in (dets if dets is not None else ())]
         with cam_lock:
             latest_faces = faces
             face_seq += 1
@@ -358,9 +363,8 @@ def tick(faces, new_faces):
         best_left_y = None
         best_right_y = None
 
-        for (x, y, w, h) in faces:
-            face_center_x = x + w / 2
-
+        for (face_center_x, anchor_y) in faces:
+            y = anchor_y - PADDLE_HEIGHT / 2   # Centre the paddle on the eyes, not hang it below
             if face_center_x < center_x:
                 if best_left_y is None or y < best_left_y:
                     best_left_y = y
