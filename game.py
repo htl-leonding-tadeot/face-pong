@@ -266,22 +266,30 @@ reset_ball(ball)
 
 COUNTDOWN_SEC = 0.5         # Per number, so 3-2-1 runs 1.5 s
 countdown_until = 0.0       # Ball is held at centre until this time
+countdown_scores = False    # Show the big score next to the numbers (only after a point)
+
+
+def start_countdown(show_scores=False):
+    """Hold the ball at centre for one 3-2-1. The same counter serves every pause."""
+    global countdown_until, countdown_scores
+    countdown_until = time.time() + 3 * COUNTDOWN_SEC
+    countdown_scores = show_scores
 
 
 def reset_game(reason, countdown=False):
     """Zero every score and recentre the ball. Only the deliberate resets get a 3-2-1."""
-    global countdown_until
     for t in tracks.values():
         t['score'] = 0
     bot_scores[0] = bot_scores[1] = 0
     reset_ball(ball)
     if countdown:
-        countdown_until = time.time() + 3 * COUNTDOWN_SEC
+        start_countdown()
     print(f"Game reset: {reason}")
 
 # --- Marker colours ---
 PLAYER_COLOR = (0, 165, 255)    # Orange, matching a human's paddle
 BYSTANDER_COLOR = (150, 150, 150)   # Grey: tracked and numbered, but not holding a slot
+SCORE_SPLASH_GAP = 260          # Px from centre to each score shown beside the countdown
 
 # --- Game & Paddle Constants ---
 PADDLE_WIDTH = 30
@@ -332,11 +340,21 @@ TRACK_TTL = 3.0             # Seconds a track (and its slot) survives with no de
 TRACK_MATCH_DIST = 180      # Max px a face may move between detections and still be one person
 TRACK_MATCH_DRIFT = 400     # Extra px of search per second unseen: people keep walking while
                             # the detector has lost them, so the window has to open up with time
+TRACK_MATCH_MAX = 420       # but never so far that a newcomer anywhere in frame gets mistaken
+                            # for someone who left; past this, they are simply a new player
+HANDOVER_GRACE = 1.0        # How long a holder may be undetected before someone else standing
+                            # on their side takes the paddle over. Under a second is nothing
+MARK_SMOOTHING = 0.3        # Per tick, fraction of the gap the marker closes on the face
+MARK_MAX_LAG = 18           # ...but never trailing further than this, so it keeps up at any
+                            # speed; the smoothing is only there to take the jitter off. Kept
+                            # just above the detector's own few-px wobble, so it damps that
+                            # without the marker visibly hanging behind a moving head
 
 tracks = {}                 # track id -> player state; see new_track()
 next_track_id = 0
 next_player_number = 1      # Reset to 1 whenever the field empties, so numbers get reused
 slots = [None, None]        # Track id playing each side, None when nobody holds it
+pending = [None, None]      # Promotion in progress: {'tid', 'started'} while the ball is stalled
 bot_scores = [0, 0]         # What the bot has earned on a side since the slot came free
 is_afk_left = False         # "AFK" now just means this side's slot is empty
 is_afk_right = False
@@ -365,7 +383,8 @@ def update_tracks(faces, now):
     for (cx, eye_y, chin_y) in faces:
         best, best_score = None, 1.0
         for tid, t in free.items():
-            limit = TRACK_MATCH_DIST + TRACK_MATCH_DRIFT * (now - t['last_seen'])
+            limit = min(TRACK_MATCH_DIST + TRACK_MATCH_DRIFT * (now - t['last_seen']),
+                        TRACK_MATCH_MAX)
             # Scored as a fraction of each track's own window, so a long-unseen track competes
             # fairly with one seen last frame instead of always losing on raw distance
             score = math.hypot(cx - t['x'], eye_y - t['eye_y']) / limit
@@ -374,7 +393,8 @@ def update_tracks(faces, now):
         if best is None:                    # Nobody nearby was here before, so this is a newcomer
             best = next_track_id
             next_track_id += 1
-            tracks[best] = {'number': next_player_number, 'score': 0}
+            tracks[best] = {'number': next_player_number, 'score': 0,
+                            'mark_x': cx, 'mark_y': chin_y}    # marker starts on the face
             next_player_number += 1
         else:
             del free[best]
@@ -386,26 +406,64 @@ def update_tracks(faces, now):
         del tracks[tid]                     # Gone long enough to count as gone
 
 
-def update_slots():
+def update_slots(now):
     """Hand out and take back the one playing slot each side has."""
     global is_afk_left, is_afk_right
 
     for side in (0, 1):
         tid = slots[side]
-        # A slot is only ever given up by its own holder: by leaving, or by crossing over.
-        # Other people crowding onto the side cannot take it off them.
-        if tid is not None and (tid not in tracks or side_of(tracks[tid]['x']) != side):
-            slots[side] = None
+        if tid is None:
+            continue
+        t = tracks.get(tid)
+        if t is None or side_of(t['x']) != side:
+            slots[side] = None              # Left for good, or walked across to the other side
             bot_scores[side] = 0            # The bot plays for itself, from zero
+            pending[side] = None
+        elif t['visible']:
+            pending[side] = None            # Still there, so nothing to hand over
+        else:
+            # Holder has dropped out with somebody else standing on their side. Rather than
+            # play on with a dead paddle, the ball stalls while that person is promoted; if
+            # they vanish too, the next one is picked and the wait starts again.
+            waiting = [other for other, o in tracks.items()
+                       if other != tid and side_of(o['x']) == side and o['visible']]
+            if not waiting:
+                pending[side] = None        # Nobody to promote; the plain TTL rules apply
+            elif pending[side] is None or pending[side]['tid'] not in waiting:
+                pending[side] = {'tid': random.choice(waiting), 'started': now}
+            elif now - pending[side]['started'] >= HANDOVER_GRACE:
+                slots[side] = pending[side]['tid']   # Straight across, so no bot flashes up
+                pending[side] = None
 
     for side in (0, 1):
         if slots[side] is None:
-            here = [tid for tid, t in tracks.items() if side_of(t['x']) == side]
-            if len(here) == 1:              # Exactly one person on that side, so no ambiguity
-                slots[side] = here[0]
+            # Only people actually there can claim it. A track still warm from someone who
+            # walked off must not grab back the slot it was just relieved of.
+            here = [tid for tid, t in tracks.items() if side_of(t['x']) == side and t['visible']]
+            if here:
+                slots[side] = random.choice(here)
+                pending[side] = None
 
     is_afk_left = slots[0] is None
     is_afk_right = slots[1] is None
+
+
+def move_marks():
+    """Ease each marker toward its face, but never let it trail by more than MARK_MAX_LAG.
+
+    The detector's box twitches a few px every frame even on a still head; following it
+    literally makes the marker buzz. Easing alone would make the marker lag badly behind
+    someone walking, so the lag is capped and the easing only smooths what is left.
+    """
+    for t in tracks.values():
+        for mark, target in (('mark_x', 'x'), ('mark_y', 'chin_y')):
+            t[mark] += (t[target] - t[mark]) * MARK_SMOOTHING
+        dx, dy = t['x'] - t['mark_x'], t['chin_y'] - t['mark_y']
+        lag = math.hypot(dx, dy)
+        if lag > MARK_MAX_LAG:
+            pull = (lag - MARK_MAX_LAG) / lag
+            t['mark_x'] += dx * pull
+            t['mark_y'] += dy * pull
 
 
 def side_label(side):
@@ -420,11 +478,14 @@ def side_score(side):
 
 
 def add_point(side):
+    """Award a point, then hold the next ball so the point can be read before play resumes."""
     tid = slots[side]
     if tid is None:
         bot_scores[side] += 1
     else:
         tracks[tid]['score'] += 1           # Points belong to the person, and travel with them
+    reset_ball(ball)
+    start_countdown(show_scores=True)
 
 
 def bounce(paddle_speed):
@@ -447,8 +508,9 @@ def tick(faces, new_faces):
     tick_counter += 1
 
     # --- 1. Ball Movement (held still through the countdown; paddles keep tracking) ---
-    counting_down = current_time < countdown_until
-    if not counting_down:
+    # A promotion in progress holds the ball where it is: play should not carry on with a
+    # paddle nobody is driving, and the point that would cost is the one being handed over
+    if current_time >= countdown_until and not any(pending):
         ball.x += ball.dx
         ball.y += ball.dy
 
@@ -460,22 +522,22 @@ def tick(faces, new_faces):
             ball.y = COURT_TOP + BALL_RADIUS
             ball.dy *= -1
         if ball.x > width - BALL_RADIUS:
-            reset_ball(ball)
             add_point(0)
-        if ball.x < BALL_RADIUS:
-            reset_ball(ball)
+        elif ball.x < BALL_RADIUS:
             add_point(1)
 
     # --- 3. Follow the people in frame (only a fresh camera frame carries new positions) ---
     if new_faces:
         was_occupied = bool(tracks)
         update_tracks(faces, current_time)
-        update_slots()
+        update_slots(current_time)
         if was_occupied and not tracks:
             # Field empty. Numbers start over at 1 and nothing is carried into the next game.
             next_player_number = 1
             bot_scores[0] = bot_scores[1] = 0
             reset_game("field empty")
+
+    move_marks()        # After the new positions land, so the lag cap applies to them
 
     # Paddle target is the slot holder's eyes. A face out in the dimmed strips still counts;
     # it clamps to the court limit, so the extremes are reachable without going to the frame edge
@@ -547,6 +609,12 @@ def tick(faces, new_faces):
                     bounce(paddle_speed)
 
 
+def outlined(img, text, org, scale, thickness, color):
+    """Text with a black halo, so it stays readable over whatever the camera happens to see."""
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 8, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
 def render(img):
     # Out-of-play strips: the camera stays visible there (faces are still tracked) but dimmed,
     # with a line on each court edge so the play area reads from across a room
@@ -561,23 +629,37 @@ def render(img):
         color = PLAYER_COLOR if not is_afk else (255, 0, 0)
         cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
 
-    cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
+    counting = countdown_until > time.time()
+    if not counting:
+        # While held the ball just sits dead centre under the countdown number, where it reads
+        # as a speck of dirt on the digit. It reappears the moment it is live again.
+        cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
 
     # Everyone in frame gets a marker and their number. Whoever holds a slot is in the player
     # colour, bystanders are grey, so it reads at a glance who the paddles belong to.
     playing = [tid for tid in slots if tid is not None]
     for tid, t in tracks.items():
+        if counting and countdown_scores:
+            break                           # The score splash owns the middle of the screen for
+                                            # 1.5 s; two sets of names there just collide
         if not t['visible']:
             continue                        # Mid-dropout: the slot is held, but do not draw a
                                             # marker on a face that is not currently there
         color = PLAYER_COLOR if tid in playing else BYSTANDER_COLOR
         name = f"Player {t['number']}"
-        mx, my = int(t['x']), int(t['chin_y']) + 10
+        mx, my = int(t['mark_x']), int(t['mark_y']) + 10
+
+        # Filling ring beside whoever is being promoted, so the wait is visibly about them
+        for p in pending:
+            if p is not None and p['tid'] == tid:
+                centre = (mx + 44, my - 6)          # beside the triangle, clear of the name
+                frac = min(1.0, (time.time() - p['started']) / HANDOVER_GRACE)
+                cv2.circle(img, centre, 17, (0, 0, 0), 7, cv2.LINE_AA)
+                cv2.circle(img, centre, 17, (90, 90, 90), 3, cv2.LINE_AA)
+                cv2.ellipse(img, centre, (17, 17), -90, 0, 360 * frac, PLAYER_COLOR, 5, cv2.LINE_AA)
         cv2.fillPoly(img, [np.array([(mx, my), (mx - 12, my + 16), (mx + 12, my + 16)])], color)
         (tw, th), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        org = (mx - tw // 2, min(my + 30 + th, height - 8))
-        cv2.putText(img, name, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5, cv2.LINE_AA)
-        cv2.putText(img, name, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+        outlined(img, name, (mx - tw // 2, min(my + 30 + th, height - 8)), 0.8, 2, color)
 
     # Scores. Sides are obvious from the layout, so the only label is who is playing:
     # the same name as under their face, or Bot when the slot is empty
@@ -587,14 +669,26 @@ def render(img):
     cv2.putText(img, f'{side_label(0)}: {side_score(0)}', (50, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
     cv2.putText(img, right_text, (width - 50 - rw, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
 
+    mid_y = (COURT_TOP + COURT_BOTTOM) // 2
+
     # 3-2-1 over the middle of the court while the ball is held
     remaining = countdown_until - time.time()
     if remaining > 0:
         n = str(math.ceil(remaining / COUNTDOWN_SEC))
         (tw, th), _ = cv2.getTextSize(n, cv2.FONT_HERSHEY_SIMPLEX, 6, 12)
-        org = ((width - tw) // 2, (COURT_TOP + COURT_BOTTOM + th) // 2)
-        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, 6, (0, 0, 0), 20, cv2.LINE_AA)
-        cv2.putText(img, n, org, cv2.FONT_HERSHEY_SIMPLEX, 6, (255, 255, 255), 12, cv2.LINE_AA)
+        outlined(img, n, ((width - tw) // 2, mid_y + th // 2), 6, 12, (255, 255, 255))
+
+        # After a point, each side's score sits either side of the number with whose it is,
+        # so players can read what just happened before the ball goes live again
+        if countdown_scores:
+            for side, sign in ((0, -1), (1, 1)):
+                cx = width // 2 + sign * SCORE_SPLASH_GAP
+                value = str(side_score(side))
+                (vw, vh), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, 3.5, 8)
+                outlined(img, value, (cx - vw // 2, mid_y + vh // 2), 3.5, 8, PLAYER_COLOR)
+                name = side_label(side)
+                (nw, _), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
+                outlined(img, name, (cx - nw // 2, mid_y + vh // 2 + 45), 1, 2, (255, 255, 255))
 
     # Orange frame on the outermost pixels: marks where the camera image ends and the screen's
     # own letterboxing begins (highgui defaults to WINDOW_KEEPRATIO, so a 16:9 image on a 3:2
