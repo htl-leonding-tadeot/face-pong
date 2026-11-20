@@ -6,6 +6,7 @@ import time
 import subprocess  # For running shell commands
 import os          # For restarting the script
 import sys         # For restarting the script
+import threading   # Camera + face detection run off the render thread
 
 width = 1280
 height = 720
@@ -13,10 +14,12 @@ height = 720
 # Make sure 'haarcascade_frontalface_default.xml' is in the same directory
 face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(3, width)
-cap.set(4, height)
+# Camera index (OpenCV order, differs from ffmpeg listing; Nikon = 0 when connected)
+cap = cv2.VideoCapture(int(os.environ.get("CAMERA", 0)))
+# Ask for the best camera mode (Nikon Z50II: 1080p60 MJPEG); frames get resized to width x height
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_FPS, 60)
 
 window_name = "image"
 
@@ -81,7 +84,18 @@ class Vec:
         self.dy = dy
 
 
-def reset_ball(ball, speed=15):
+# --- Timing ---
+TICK_RATE = 60              # Physics ticks per second (fixed)
+TICK = 1.0 / TICK_RATE
+MAX_FPS = 60                # Render cap
+FRAME_TIME = 1.0 / MAX_FPS
+# Tuning constants below were written for the old ~30 fps per-frame loop.
+# K converts "per old frame" to "per tick" so gameplay speed stays the same.
+DESIGN_FPS = 30
+K = DESIGN_FPS / TICK_RATE
+
+
+def reset_ball(ball, speed=15 * K):
     """Reset ball to center with random direction within 15 degrees"""
     ball.x = width/2
     ball.y = height/2
@@ -98,6 +112,34 @@ def reset_ball(ball, speed=15):
     ball.dy = speed * math.sin(angle_rad)
 
 
+# --- Camera thread: grabs frames and runs face detection at camera rate ---
+latest_img = np.zeros((height, width, 3), np.uint8)
+latest_faces = ()
+face_seq = 0                # Increments per processed camera frame
+camera_ok = True
+stop_event = threading.Event()
+cam_lock = threading.Lock()
+
+
+def camera_loop():
+    global latest_img, latest_faces, face_seq, camera_ok
+    while not stop_event.is_set():
+        ret, frame = cap.read()  # Blocks until next camera frame (releases GIL)
+        if not ret:
+            camera_ok = False
+            return
+        # Camera may ignore the requested resolution; game logic assumes width x height
+        frame = cv2.resize(cv2.flip(frame, 1), (width, height))
+        faces = face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.25, 4)
+        with cam_lock:
+            latest_img, latest_faces = frame, faces
+            face_seq += 1
+
+
+cam_thread = threading.Thread(target=camera_loop, daemon=True)
+cam_thread.start()
+
+
 paddleX = width - 230
 
 ball = Vec(100, 100, 10, 10)
@@ -111,6 +153,7 @@ PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
 BALL_RADIUS = 9
 PADDLE_INFLUENCE_FACTOR = 0.5
+HUMAN_SMOOTHING = 0.5       # Per tick: fraction of gap to face position closed (camera is only 30 fps)
 
 # --- Angle Clamping Constants ---
 MIN_ANGLE_DEG = 15
@@ -121,34 +164,38 @@ MAX_ANGLE_TAN = math.tan(math.radians(MAX_ANGLE_DEG))
 
 # --- AFK Bot Constants ---
 AFK_TIMEOUT = 10.0
-BOT_SPEED = 12
+BOT_SPEED = 12 * K
 BOT_DEV_RANGE = 75
 BOT_OVERSHOOT_FACTOR = 1.1
-BOT_UPDATE_INTERVAL = 3
-BOT_SMOOTHING_FACTOR = 0.2 # NEW: (e.g., 0.2 = 20% smoothing per frame)
+BOT_UPDATE_INTERVAL = max(1, round(3 / K))       # In ticks (same reaction time as before)
+BOT_SMOOTHING_FACTOR = 1 - (1 - 0.2) ** K        # 20% per old frame, rescaled per tick
 
 # --- Persistent Paddle Vertical Positions ---
 leftPaddleY = height // 2 - PADDLE_HEIGHT // 2
 rightPaddleY = height // 2 - PADDLE_HEIGHT // 2
+leftFaceY = leftPaddleY     # Latest detected face position (human target)
+rightFaceY = rightPaddleY
 
 # --- Previous Paddle Positions (for speed tracking) ---
 prevLeftPaddleY = leftPaddleY
 prevRightPaddleY = rightPaddleY
 
-# --- Bot Target/Frame Tracking ---
-raw_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # RENAMED
-raw_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # RENAMED
-smooth_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2 # NEW
-smooth_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2 # NEW
-frame_counter = 0
+# --- Bot Target/Tick Tracking ---
+raw_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
+raw_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2
+smooth_left_bot_target_y = leftPaddleY + PADDLE_HEIGHT / 2
+smooth_right_bot_target_y = rightPaddleY + PADDLE_HEIGHT / 2
+tick_counter = 0
 
 # --- AFK Time Tracking ---
 current_time = time.time()
 last_face_time_left = current_time
 last_face_time_right = current_time
+is_afk_left = False
+is_afk_right = False
 
 # --- Auto-Update Tracking ---
-UPDATE_CHECK_INTERVAL = 600 # 10 minutes (in seconds)
+UPDATE_CHECK_INTERVAL = 60 # 1 minute (in seconds)
 last_update_check_time = current_time
 update_check_pending = False
 was_idle_last_frame = False # Check for transition to idle
@@ -158,19 +205,24 @@ was_idle_last_frame = False # Check for transition to idle
 center_x = width / 2
 
 
-while True:
-    current_time = time.time()
-    frame_counter += 1
+def bounce(paddle_speed):
+    """Apply paddle influence & clamp angle after a paddle hit"""
+    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
+    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
+    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
+    sign_dy = np.sign(ball.dy)
+    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
+    ball.dy = clamped_abs_dy * sign_dy
 
-    ret, img = cap.read()
-    if not ret:
-        break
 
-    img = cv2.flip(img, 1)
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # --- Face Detection ---
-    faces = face_cascade.detectMultiScale(gray_img, 1.25, 4)
+def tick(faces, new_faces):
+    """Advance the game by exactly one fixed timestep"""
+    global leftScore, rightScore, leftPaddleY, rightPaddleY, leftFaceY, rightFaceY
+    global prevLeftPaddleY, prevRightPaddleY, last_face_time_left, last_face_time_right
+    global raw_left_bot_target_y, raw_right_bot_target_y
+    global smooth_left_bot_target_y, smooth_right_bot_target_y
+    global tick_counter, is_afk_left, is_afk_right
+    tick_counter += 1
 
     # --- 1. Ball Movement ---
     ball.x += ball.dx
@@ -191,32 +243,42 @@ while True:
         rightScore = rightScore + 1
 
     # --- 3. Location-based Paddle Assignment (Human Input) ---
-    best_left_y = None
-    best_right_y = None
+    # Only a fresh camera frame counts as "face seen"; ticks run faster than the camera
+    if new_faces:
+        best_left_y = None
+        best_right_y = None
 
-    for (x, y, w, h) in faces:
-        face_center_x = x + w / 2
+        for (x, y, w, h) in faces:
+            face_center_x = x + w / 2
 
-        if face_center_x < center_x:
-            if best_left_y is None or y < best_left_y:
-                best_left_y = y
-        else:
-            if best_right_y is None or y < best_right_y:
-                best_right_y = y
+            if face_center_x < center_x:
+                if best_left_y is None or y < best_left_y:
+                    best_left_y = y
+            else:
+                if best_right_y is None or y < best_right_y:
+                    best_right_y = y
 
-    if best_left_y is not None:
-        leftPaddleY = best_left_y
-        last_face_time_left = current_time
+        if best_left_y is not None:
+            leftFaceY = best_left_y
+            last_face_time_left = current_time
 
-    if best_right_y is not None:
-        rightPaddleY = best_right_y
-        last_face_time_right = current_time
+        if best_right_y is not None:
+            rightFaceY = best_right_y
+            last_face_time_right = current_time
+
+    is_afk_left = current_time - last_face_time_left > AFK_TIMEOUT
+    is_afk_right = current_time - last_face_time_right > AFK_TIMEOUT
+
+    # Humans glide toward their face position so 30 fps camera input looks smooth at 60 ticks
+    if not is_afk_left:
+        leftPaddleY += (leftFaceY - leftPaddleY) * HUMAN_SMOOTHING
+    if not is_afk_right:
+        rightPaddleY += (rightFaceY - rightPaddleY) * HUMAN_SMOOTHING
 
     # --- 4. AFK Bot Logic ---
 
     # 4a. Update Bot's RAW Target (Reaction Time)
-    # This still only runs every few frames, simulating human reaction delay
-    if frame_counter % BOT_UPDATE_INTERVAL == 0:
+    if tick_counter % BOT_UPDATE_INTERVAL == 0:
         deviation = random.uniform(-BOT_DEV_RANGE, BOT_DEV_RANGE)
         base_target_y = ball.y + deviation
 
@@ -225,129 +287,123 @@ while True:
         if ball.dx > 0: # Right Bot tracks
             raw_right_bot_target_y = base_target_y
 
-    # 4b. NEW: Update Bot's SMOOTH Target (Movement Fluidity)
-    # This runs every frame, making the bot's goal glide smoothly
+    # 4b. Update Bot's SMOOTH Target (Movement Fluidity)
     smooth_left_bot_target_y = (smooth_left_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_left_bot_target_y * BOT_SMOOTHING_FACTOR)
     smooth_right_bot_target_y = (smooth_right_bot_target_y * (1 - BOT_SMOOTHING_FACTOR)) + (raw_right_bot_target_y * BOT_SMOOTHING_FACTOR)
 
-
     # 4c. Left Paddle Bot Movement
-    is_afk_left = False
-    if current_time - last_face_time_left > AFK_TIMEOUT:
-        is_afk_left = True
+    if is_afk_left:
         paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
-        # Use the SMOOTH target for movement
         diff_y = (smooth_left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        leftPaddleY = int(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+        leftPaddleY = float(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
     # 4d. Right Paddle Bot Movement
-    is_afk_right = False
-    if current_time - last_face_time_right > AFK_TIMEOUT:
-        is_afk_right = True
+    if is_afk_right:
         paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
-        # Use the SMOOTH target for movement
         diff_y = (smooth_right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        rightPaddleY = int(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+        rightPaddleY = float(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
 
-    # 4e. Calculate Paddle Speeds
+    # 4e. Calculate Paddle Speeds (per tick, same unit as ball.dy)
     leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
     rightPaddleSpeed = rightPaddleY - prevRightPaddleY
+    prevLeftPaddleY = leftPaddleY
+    prevRightPaddleY = rightPaddleY
 
-
-    # --- 5. Paddle Drawing and Collision Check ---
-
-    paddle_data = [
-        (0, leftPaddleY, is_afk_left, leftPaddleSpeed),
-        (1, rightPaddleY, is_afk_right, rightPaddleSpeed)
-    ]
-
-    for index, paddle_y, is_afk, paddle_speed in paddle_data:
+    # --- 5. Paddle Collision Check ---
+    for index, paddle_y, paddle_speed in ((0, leftPaddleY, leftPaddleSpeed), (1, rightPaddleY, rightPaddleSpeed)):
         paddle_x = 100 + (index * paddleX)
-
-        # Orange for Human, Blue for Bot
-        color = (0, 165, 255) if not is_afk else (255, 0, 0)
-
-        # Draw paddle
-        cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
-
-        # Collision Check:
         if paddle_y - BALL_RADIUS <= ball.y <= paddle_y + PADDLE_HEIGHT + BALL_RADIUS:
-
-            # --- Left paddle (index == 0) ---
             if index == 0:
                 if ball.dx < 0 and (paddle_x + PADDLE_WIDTH) >= (ball.x - BALL_RADIUS) >= paddle_x:
                     ball.dx *= -1
                     ball.x = paddle_x + PADDLE_WIDTH + BALL_RADIUS
-
-                    # Apply Paddle Influence & Clamp Angle
-                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
-                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-                    sign_dy = np.sign(ball.dy)
-                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
-                    ball.dy = clamped_abs_dy * sign_dy
-
-            # --- Right paddle (index == 1) ---
+                    bounce(paddle_speed)
             else:
                 if ball.dx > 0 and paddle_x <= (ball.x + BALL_RADIUS) <= (paddle_x + PADDLE_WIDTH):
                     ball.dx *= -1
                     ball.x = paddle_x - BALL_RADIUS
+                    bounce(paddle_speed)
 
-                    # Apply Paddle Influence & Clamp Angle
-                    ball.dy += paddle_speed * PADDLE_INFLUENCE_FACTOR
-                    min_abs_dy = abs(ball.dx) * MIN_ANGLE_TAN
-                    max_abs_dy = abs(ball.dx) * MAX_ANGLE_TAN
-                    sign_dy = np.sign(ball.dy)
-                    clamped_abs_dy = np.clip(abs(ball.dy), min_abs_dy, max_abs_dy)
-                    ball.dy = clamped_abs_dy * sign_dy
 
-    # --- 6. Drawing and Display ---
+def render(img):
+    for index, paddle_y, is_afk in ((0, leftPaddleY, is_afk_left), (1, rightPaddleY, is_afk_right)):
+        paddle_x = 100 + (index * paddleX)
+        # Orange for Human, Blue for Bot
+        color = (0, 165, 255) if not is_afk else (255, 0, 0)
+        cv2.rectangle(img, (paddle_x, int(paddle_y)), (paddle_x + PADDLE_WIDTH, int(paddle_y + PADDLE_HEIGHT)), color, -1)
+
     cv2.circle(img, (int(ball.x), int(ball.y)), BALL_RADIUS, (0, 0, 255), -1)
 
     left_status = "Bot" if is_afk_left else "Human"
     right_status = "Bot" if is_afk_right else "Human"
-
-    text1 = cv2.putText(img, f'L ({left_status}): {leftScore}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-    text2 = cv2.putText(img, f'R ({right_status}): {rightScore}', (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(img, f'L ({left_status}): {leftScore}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(img, f'R ({right_status}): {rightScore}', (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
 
     cv2.imshow(window_name, img)
 
-    # --- 7. Auto-Update Logic ---
 
-    # 7a. Check if 10 minutes have passed to flag a pending update
+seen_face_seq = 0
+accumulator = 0.0
+last_time = time.perf_counter()
+next_frame = last_time
+
+while camera_ok:
+    now = time.perf_counter()
+    # ponytail: clamp catch-up so a stall (window drag, git fetch) doesn't spiral; game just slows briefly
+    accumulator += min(now - last_time, 0.25)
+    last_time = now
+    current_time = time.time()
+
+    with cam_lock:
+        img, faces, seq = latest_img, latest_faces, face_seq
+
+    # --- Fixed-timestep physics ---
+    while accumulator >= TICK:
+        tick(faces, seq != seen_face_seq)
+        seen_face_seq = seq
+        accumulator -= TICK
+
+    # --- Render (copy: camera frame is shared and may be redrawn next frame) ---
+    render(img.copy())
+
+    # --- Auto-Update Logic ---
     if current_time - last_update_check_time > UPDATE_CHECK_INTERVAL:
-        print("10-minute interval passed. Flagging for update check.")
+        print("Update interval passed. Flagging for update check.")
         update_check_pending = True
-        last_update_check_time = current_time # Reset the 10-min timer
+        last_update_check_time = current_time # Reset the update timer
 
-    # 7b. Check if we should perform the update check
     is_idle = is_afk_left and is_afk_right
     just_became_idle = is_idle and not was_idle_last_frame
 
     if update_check_pending and is_idle:
-
         if just_became_idle:
             print("Transitioned to dual bot mode with update pending. Checking now...")
         else:
-            print("Idle mode and 10-min timer elapsed. Checking now...")
+            print("Idle mode and update timer elapsed. Checking now...")
 
         if check_for_update():
             restart_script() # This will stop the script
 
         update_check_pending = False
 
+    was_idle_last_frame = is_idle
 
-    # --- 8. Exit Condition ---
-    k = cv2.waitKey(30) & 0xff
+    # --- Exit Condition (waitKey(1) also pumps the window's event loop) ---
+    k = cv2.waitKey(1) & 0xff
     if k == 27: # ESC key
         break
 
-    # --- 9. Update previous frame's paddle positions ---
-    prevLeftPaddleY = leftPaddleY
-    prevRightPaddleY = rightPaddleY
-    was_idle_last_frame = is_idle # Update idle state for next frame
+    # --- Frame cap: sleep only the time left until the next frame deadline ---
+    next_frame += FRAME_TIME
+    remaining = next_frame - time.perf_counter()
+    if remaining > 0:
+        time.sleep(remaining)
+    else:
+        next_frame = time.perf_counter()  # Running late: don't try to catch up on frames
 
+stop_event.set()
+cam_thread.join(timeout=1)
 cap.release()
 cv2.destroyAllWindows()
