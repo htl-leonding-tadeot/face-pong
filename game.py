@@ -147,7 +147,10 @@ class Vec:
 
 
 # --- Timing ---
-TICK_RATE = 60              # Physics ticks per second (fixed)
+# Must not equal MAX_FPS: at 60/60 the accumulator in the main loop sits exactly on the frame
+# boundary, and since sleep() overshoots and waitKey(1) costs a millisecond, it drifts into running
+# 2 ticks on one frame (ball jumps double) then 0 on the next (ball freezes) -- a repeated stutter.
+TICK_RATE = 240             # Physics ticks per second (fixed)
 TICK = 1.0 / TICK_RATE
 MAX_FPS = 60                # Render cap
 FRAME_TIME = 1.0 / MAX_FPS
@@ -296,7 +299,9 @@ PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
 BALL_RADIUS = 9
 PADDLE_INFLUENCE_FACTOR = 0.5
-HUMAN_SMOOTHING = 0.5       # Per tick: fraction of gap to face position closed (camera is only 30 fps)
+HUMAN_SMOOTHING = 1 - 0.5 ** (60 / TICK_RATE)   # Per tick: fraction of gap to face position closed
+                                                # (camera is only 30 fps). A decay, not a rate, so it
+                                                # rescales as one off the old 0.5-per-tick-at-60Hz
 
 # --- Angle Clamping Constants ---
 MIN_ANGLE_DEG = 15
