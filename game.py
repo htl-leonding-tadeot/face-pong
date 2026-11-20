@@ -13,6 +13,14 @@ import re
 width = 1280
 height = 720
 
+# Fraction of the frame held out of play at the top and bottom. The paddle follows the face
+# one-to-one, and a face at the very frame edge is both awkward to reach and the first thing
+# the cascade loses, so the court stops short of it. Faces in the strips are still tracked and
+# just pin the paddle at the court limit, which is how you reach the extremes.
+COURT_PADDING = 0.10
+COURT_TOP = round(height * COURT_PADDING)
+COURT_BOTTOM = height - COURT_TOP
+
 # Make sure 'haarcascade_frontalface_default.xml' is in the same directory
 face_cascade = cv2.CascadeClassifier(r'./haarcascade_frontalface_default.xml')
 
@@ -149,7 +157,7 @@ K = DESIGN_FPS / TICK_RATE
 def reset_ball(ball, speed=15 * K):
     """Reset ball to center with random direction within 15 degrees"""
     ball.x = width/2
-    ball.y = height/2
+    ball.y = (COURT_TOP + COURT_BOTTOM) / 2
 
     # Random angle between -15 and 15 degrees
     angle = random.uniform(-15, 15)
@@ -189,8 +197,14 @@ def camera_loop():
             with frame_ready:
                 frame_ready.notify_all()    # Don't leave the detector blocked on a dead camera
             return
-        # Camera may ignore the requested resolution; game logic assumes width x height
-        frame = cv2.resize(cv2.flip(frame, 1), (width, height))
+        # Camera may ignore the requested resolution; game logic assumes width x height.
+        # Cover, not contain: centre-crop to 16:9 first, so a camera that isn't 16:9 loses the
+        # edges instead of being stretched. Both cameras here are 16:9, where this is a no-op.
+        frame = cv2.flip(frame, 1)
+        fh, fw = frame.shape[:2]
+        cw, ch = min(fw, round(fh * width / height)), min(fh, round(fw * height / width))
+        y0, x0 = (fh - ch) // 2, (fw - cw) // 2
+        frame = cv2.resize(frame[y0:y0 + ch, x0:x0 + cw], (width, height))
         with frame_ready:
             latest_img = frame              # Fresh array each frame, so readers can hold it unlocked
             frame_seq += 1
@@ -325,11 +339,11 @@ def tick(faces, new_faces):
     ball.y += ball.dy
 
     # --- 2. Wall & Goal Collisions ---
-    if ball.y > height - BALL_RADIUS:
-        ball.y = height - BALL_RADIUS
+    if ball.y > COURT_BOTTOM - BALL_RADIUS:
+        ball.y = COURT_BOTTOM - BALL_RADIUS
         ball.dy *= -1
-    if ball.y < BALL_RADIUS:
-        ball.y = BALL_RADIUS
+    if ball.y < COURT_TOP + BALL_RADIUS:
+        ball.y = COURT_TOP + BALL_RADIUS
         ball.dy *= -1
     if ball.x > width - BALL_RADIUS:
         reset_ball(ball)
@@ -354,12 +368,14 @@ def tick(faces, new_faces):
                 if best_right_y is None or y < best_right_y:
                     best_right_y = y
 
+        # A face in the out-of-play strips still counts; it clamps to the court limit, so the
+        # extremes are reachable without putting your head at the very edge of the frame
         if best_left_y is not None:
-            leftFaceY = best_left_y
+            leftFaceY = min(max(best_left_y, COURT_TOP), COURT_BOTTOM - PADDLE_HEIGHT)
             last_face_time_left = current_time
 
         if best_right_y is not None:
-            rightFaceY = best_right_y
+            rightFaceY = min(max(best_right_y, COURT_TOP), COURT_BOTTOM - PADDLE_HEIGHT)
             last_face_time_right = current_time
 
     is_afk_left = current_time - last_face_time_left > AFK_TIMEOUT
@@ -392,14 +408,14 @@ def tick(faces, new_faces):
         paddle_center_y = leftPaddleY + PADDLE_HEIGHT / 2
         diff_y = (smooth_left_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        leftPaddleY = float(np.clip(leftPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+        leftPaddleY = float(np.clip(leftPaddleY + move_y, COURT_TOP, COURT_BOTTOM - PADDLE_HEIGHT))
 
     # 4d. Right Paddle Bot Movement
     if is_afk_right:
         paddle_center_y = rightPaddleY + PADDLE_HEIGHT / 2
         diff_y = (smooth_right_bot_target_y - paddle_center_y) * BOT_OVERSHOOT_FACTOR
         move_y = np.clip(diff_y, -BOT_SPEED, BOT_SPEED)
-        rightPaddleY = float(np.clip(rightPaddleY + move_y, 0, height - PADDLE_HEIGHT))
+        rightPaddleY = float(np.clip(rightPaddleY + move_y, COURT_TOP, COURT_BOTTOM - PADDLE_HEIGHT))
 
     # 4e. Calculate Paddle Speeds (per tick, same unit as ball.dy)
     leftPaddleSpeed = leftPaddleY - prevLeftPaddleY
@@ -424,6 +440,13 @@ def tick(faces, new_faces):
 
 
 def render(img):
+    # Out-of-play strips: the camera stays visible there (faces are still tracked) but dimmed,
+    # with a line on each court edge so the play area reads from across a room
+    img[:COURT_TOP] = img[:COURT_TOP] // 3
+    img[COURT_BOTTOM:] = img[COURT_BOTTOM:] // 3
+    cv2.line(img, (0, COURT_TOP), (width, COURT_TOP), (255, 255, 255), 2)
+    cv2.line(img, (0, COURT_BOTTOM), (width, COURT_BOTTOM), (255, 255, 255), 2)
+
     for index, paddle_y, is_afk in ((0, leftPaddleY, is_afk_left), (1, rightPaddleY, is_afk_right)):
         paddle_x = 100 + (index * paddleX)
         # Orange for Human, Blue for Bot
@@ -434,8 +457,15 @@ def render(img):
 
     left_status = "Bot" if is_afk_left else "Human"
     right_status = "Bot" if is_afk_right else "Human"
-    cv2.putText(img, f'L ({left_status}): {leftScore}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
-    cv2.putText(img, f'R ({right_status}): {rightScore}', (700, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    # Inside the court: the strips are dimmed, and this text is black
+    score_y = COURT_TOP + 40
+    cv2.putText(img, f'L ({left_status}): {leftScore}', (50, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(img, f'R ({right_status}): {rightScore}', (700, score_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2, cv2.LINE_AA)
+
+    # Orange frame on the outermost pixels: marks where the camera image ends and the screen's
+    # own letterboxing begins (highgui defaults to WINDOW_KEEPRATIO, so a 16:9 image on a 3:2
+    # or 16:10 panel gets black bars that are otherwise indistinguishable from the image)
+    cv2.rectangle(img, (1, 1), (width - 2, height - 2), (0, 165, 255), 2)
 
     cv2.imshow(window_name, img)
 
