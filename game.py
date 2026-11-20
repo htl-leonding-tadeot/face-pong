@@ -263,6 +263,12 @@ reset_ball(ball)
 leftScore = 0
 rightScore = 0
 
+
+def reset_scores(reason):
+    global leftScore, rightScore
+    leftScore = rightScore = 0
+    print(f"Score reset: {reason}")
+
 # --- Game & Paddle Constants ---
 PADDLE_WIDTH = 30
 PADDLE_HEIGHT = 100
@@ -308,6 +314,8 @@ last_face_time_left = current_time
 last_face_time_right = current_time
 is_afk_left = False
 is_afk_right = False
+# Who is playing each side, as (left_is_bot, right_is_bot). Any change starts a new game.
+lineup = (is_afk_left, is_afk_right)
 
 # --- Auto-Update Tracking ---
 UPDATE_CHECK_INTERVAL = 60 # 1 minute (in seconds)
@@ -336,7 +344,7 @@ def tick(faces, new_faces):
     global prevLeftPaddleY, prevRightPaddleY, last_face_time_left, last_face_time_right
     global raw_left_bot_target_y, raw_right_bot_target_y
     global smooth_left_bot_target_y, smooth_right_bot_target_y
-    global tick_counter, is_afk_left, is_afk_right
+    global tick_counter, is_afk_left, is_afk_right, lineup
     tick_counter += 1
 
     # --- 1. Ball Movement ---
@@ -384,6 +392,16 @@ def tick(faces, new_faces):
 
     is_afk_left = current_time - last_face_time_left > AFK_TIMEOUT
     is_afk_right = current_time - last_face_time_right > AFK_TIMEOUT
+
+    # Whoever was playing is no longer who is playing: somebody arrived or left on one side,
+    # or both. Carrying the old score into a new pairing is meaningless, so start over.
+    # Note this can only see a side go empty for AFK_TIMEOUT and come back; one person
+    # stepping straight into another's place is indistinguishable from the same person moving.
+    if (is_afk_left, is_afk_right) != lineup:
+        was, lineup = lineup, (is_afk_left, is_afk_right)
+        reset_scores("%s -> %s" % (
+            "/".join("bot" if b else "human" for b in was),
+            "/".join("bot" if b else "human" for b in lineup)))
 
     # Humans glide toward their face position so 30 fps camera input looks smooth at 60 ticks
     if not is_afk_left:
@@ -537,6 +555,8 @@ while camera_ok:
     k = cv2.waitKey(1) & 0xff
     if k == 27: # ESC key
         break
+    if k in (ord('r'), ord('R')):   # Manual score reset
+        reset_scores("'r' pressed")
 
     # --- Frame cap: sleep only the time left until the next frame deadline ---
     next_frame += FRAME_TIME
